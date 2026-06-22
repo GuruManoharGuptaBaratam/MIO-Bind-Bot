@@ -9,6 +9,10 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 
+
+static uint8_t s_loopback_buf[120] = {0};
+static uint32_t s_loopback_len = 0;
+
 static const char *TAG = "MIO_HFP";
 
 static esp_bd_addr_t g_remote_bda = {0};
@@ -56,6 +60,8 @@ static void incoming_data_callback(const uint8_t *buf, uint32_t len)
     uint8_t *copy = malloc(len);
     if (!copy) return;
     memcpy(copy, buf, len);
+    memcpy(s_loopback_buf, buf, len);
+    s_loopback_len = len;
 
     mio_audio_msg_t msg = {
         .handle = 0,
@@ -70,10 +76,30 @@ static void incoming_data_callback(const uint8_t *buf, uint32_t len)
 
 static uint32_t outgoing_data_callback(uint8_t *buf, uint32_t len)
 {
-    memset(buf, 0, len);
+    if (s_loopback_len > 0) {
+        uint32_t copy_len = len < s_loopback_len ? len : s_loopback_len;
+        
+        // Apply gain to boost volume
+        int16_t *samples = (int16_t *)s_loopback_buf;
+        int16_t *out = (int16_t *)buf;
+        uint32_t num_samples = copy_len / 2;
+        
+        for (uint32_t i = 0; i < num_samples; i++) {
+            int32_t amplified = (int32_t)samples[i] * 3; // increase 3 for more volume
+            // Clamp to prevent overflow
+            if (amplified > 32767) amplified = 32767;
+            if (amplified < -32768) amplified = -32768;
+            out[i] = (int16_t)amplified;
+        }
+        
+        if (copy_len < len) {
+            memset(buf + copy_len, 0, len - copy_len);
+        }
+    } else {
+        memset(buf, 0, len);
+    }
     return len;
 }
-
 static void hfp_callback(
     esp_hf_cb_event_t event,
     esp_hf_cb_param_t *param)
