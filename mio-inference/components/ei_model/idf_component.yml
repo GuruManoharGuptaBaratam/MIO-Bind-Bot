@@ -1,0 +1,4 @@
+# Component manager dependency manifest for the Edge Impulse Model library context
+dependencies:
+  espressif/esp-dsp:
+    version: "^1.4.0" # Downloads the v1.x branch matching the core math library hooks
