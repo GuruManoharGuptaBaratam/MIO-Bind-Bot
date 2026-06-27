@@ -13,12 +13,11 @@
 
 // Load the multi-impulse parameter arrays
 #include "model-parameters/model_variables.h"
-
-// Explicitly link snapshot structures compiled inside model_variables.h
-extern const ei_impulse_t ei_impulse_snapshot_1036490;
-extern const ei_impulse_t ei_impulse_snapshot_1037438;
-
 #include <inttypes.h>
+
+extern const ei_impulse_t impulse_1036490_1;
+extern const ei_impulse_t impulse_1037438_1;
+
 static const char *TAG = "INF_ENGINE";
 
 // ── Buffers ───────────────────────────────────────────────────────────────────
@@ -29,10 +28,7 @@ static int16_t *g_uart_rx_buf = NULL;   // staging buffer for UART reads
 #define UART_RX_BUF_BYTES  4096
 #define CHUNK_SAMPLES      512
 
-#include "driver/gpio.h"
-#define LED_PIN GPIO_NUM_2
-
-// ── State machine ─────────────────────────────────────────────────────────────
+// ── State machine 
 typedef enum {
     STATE_WAKEWORD,
     STATE_CAPTURE,
@@ -43,7 +39,7 @@ static ie_state_t g_state         = STATE_WAKEWORD;
 static uint32_t   g_ww_write_pos  = 0;
 static uint32_t   g_cmd_write_pos = 0;
 
-// ── EI signal callbacks ───────────────────────────────────────────────────────
+// ── EI signal callbacks 
 // Uses explicit 'unsigned int' properties to guarantee function pointer binding matches on GCC 15
 static int ww_get_data(unsigned int offset, unsigned int length, float *out)
 {
@@ -62,7 +58,7 @@ static int cmd_get_data(unsigned int offset, unsigned int length, float *out)
     return 0;
 }
 
-// ── UART init ─────────────────────────────────────────────────────────────────
+// ── UART init 
 static void uart_init(void)
 {
     // Explicit sequential initializers conforming with ESP-IDF v6.0 driver updates
@@ -81,10 +77,15 @@ static void uart_init(void)
     ESP_ERROR_CHECK(uart_set_pin(IE_UART_NUM,
                                  IE_UART_TX_PIN, IE_UART_RX_PIN,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_LOGI(TAG,
+         "UART=%d  TX=%d  RX=%d",
+         IE_UART_NUM,
+         IE_UART_TX_PIN,
+         IE_UART_RX_PIN);
     ESP_LOGI(TAG, "UART2 init OK @ %d baud", IE_UART_BAUD);
 }
 
-// ── Inference task ────────────────────────────────────────────────────────────
+// ── Inference task
 static void inference_task(void *arg)
 {
     ESP_LOGI(TAG, "Inference task started, state=WAKEWORD");
@@ -99,7 +100,7 @@ static void inference_task(void *arg)
     cmd_signal.get_data     = &cmd_get_data;
 
     while (1) {
-        // ── Read available UART bytes ─────────────────────────────────────
+        // ── Read available UART bytes
         size_t avail = 0;
         uart_get_buffered_data_len(IE_UART_NUM, &avail);
 
@@ -126,7 +127,7 @@ static void inference_task(void *arg)
 
         switch (g_state) {
 
-        // ── State A: wakeword ─────────────────────────────────────────────
+        // ── State A: wakeword 
         case STATE_WAKEWORD: {
             
             for (int i = 0; i < samples_read; i++) {
@@ -139,24 +140,25 @@ static void inference_task(void *arg)
             ei_impulse_result_t ww_result = {};
             
             // Pointer abstraction that satisfies compiler safety evaluations
-            const ei_impulse_t *ww_snapshot_ptr = &ei_impulse_snapshot_1036490;
+            const ei_impulse_t *ww_snapshot_ptr = &impulse_1036490_1;
             EI_IMPULSE_ERROR err = run_classifier_continuous(&ww_signal, &ww_result, ww_snapshot_ptr, false);
             if (err != EI_IMPULSE_OK) {
                 ESP_LOGE(TAG, "WW classifier error: %d", err);
                 break;
             }
-            for (uint32_t l = 0; l < EI_CLASSIFIER_LABEL_COUNT; l++) {
-                ESP_LOGI(TAG, "WW [%s] = %.3f",
-                        ww_result.classification[l].label,
-                        ww_result.classification[l].value);
+            for (uint32_t i = 0; i < impulse_1036490_1.label_count; i++) {
+                ESP_LOGI(TAG,
+                        "WW [%s] = %.3f",
+                        impulse_1036490_1.categories[i],
+                        ww_result.classification[i].value);
             }
 
-            for (uint32_t l = 0; l < EI_CLASSIFIER_LABEL_COUNT; l++) {
+            for (uint32_t l = 0; l < 2; l++) {
                 if (strcmp(ww_result.classification[l].label, "hey_mio") == 0) {
                     float conf = ww_result.classification[l].value;
                     ESP_LOGI(TAG, "hey_mio conf=%.3f", conf);
                     if (conf > WW_CONFIDENCE_THRESHOLD) {
-                        gpio_set_level(LED_PIN, 1); 
+                        // gpio_set_level(LED_PIN, 1); 
                         ESP_LOGI(TAG, "Wakeword detected (%.3f) → CAPTURE", conf);
                         g_cmd_write_pos = 0;
                         memset(g_cmd_capture, 0,
@@ -169,7 +171,7 @@ static void inference_task(void *arg)
             break;
         }
 
-        // ── State B: capture 2 seconds ────────────────────────────────────
+        // ── State B: capture 2 seconds 
         case STATE_CAPTURE: {
             uint32_t space = CMD_CAPTURE_SAMPLES - g_cmd_write_pos;
             uint32_t copy  = ((uint32_t)samples_read < space)
@@ -191,8 +193,9 @@ static void inference_task(void *arg)
             ei_impulse_result_t cmd_result = {};
             
             // Pointer abstraction that satisfies compiler safety evaluations
-            const ei_impulse_t *cmd_snapshot_ptr = &ei_impulse_snapshot_1037438;
+            const ei_impulse_t *cmd_snapshot_ptr = &impulse_1037438_1;
             EI_IMPULSE_ERROR err = run_classifier_continuous(&cmd_signal, &cmd_result, cmd_snapshot_ptr, false);
+            
             if (err != EI_IMPULSE_OK) {
                 ESP_LOGE(TAG, "CMD classifier error: %d", err);
                 g_state = STATE_WAKEWORD;
@@ -202,14 +205,11 @@ static void inference_task(void *arg)
             float   best_conf  = 0.0f;
             int     best_idx   = -1;
             
-            for (uint32_t l = 0; l < EI_CLASSIFIER_LABEL_COUNT; l++) {
-                ESP_LOGI(TAG, "  [%s] %.3f",
-                         cmd_result.classification[l].label,
-                         cmd_result.classification[l].value);
-                if (cmd_result.classification[l].value > best_conf) {
-                    best_conf = cmd_result.classification[l].value;
-                    best_idx  = (int)l;
-                }
+            for (uint32_t i = 0; i < impulse_1037438_1.label_count; i++) {
+                ESP_LOGI(TAG,
+                        "CMD [%s] = %.3f",
+                        impulse_1037438_1.categories[i],
+                        cmd_result.classification[i].value);
             }
 
             if (best_idx >= 0 && best_conf > CMD_CONFIDENCE_THRESHOLD) {
@@ -217,9 +217,9 @@ static void inference_task(void *arg)
                 ESP_LOGI(TAG, "COMMAND: %s (%.3f)", label, best_conf);
 
                 uint8_t cmd_byte = 0x00;
-                if      (strcmp(label, "KANSEI") == 0) cmd_byte = 0x01;
-                else if (strcmp(label, "KIROKU") == 0) cmd_byte = 0x02;
-                else if (strcmp(label, "IBASHO") == 0) cmd_byte = 0x03;
+                if      (strcmp(label, "kansei") == 0) cmd_byte = 0x01;
+                else if (strcmp(label, "kiroku") == 0) cmd_byte = 0x02;
+                else if (strcmp(label, "ibasho") == 0) cmd_byte = 0x03;
 
                 if (cmd_byte != 0x00) {
                     uint8_t pkt[3] = { 0xAA, cmd_byte, static_cast<uint8_t>(0xAA ^ cmd_byte) };
@@ -232,20 +232,20 @@ static void inference_task(void *arg)
             }
 
             g_state = STATE_WAKEWORD;
-            gpio_set_level(LED_PIN, 0);
             break;
         }
 
-        } // switch
-    } // while
+        }
+    } 
 }
 
-// ── Public init ───────────────────────────────────────────────────────────────
+// ---- Model Testing code block ---- [ refer model_testing/combined_model_test.cpp ]
+ 
+
+
+// -- Feature Callback calling --
 void inference_engine_init(void)
 {
-    gpio_reset_pin(LED_PIN);
-    gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(LED_PIN, 0);
 
     g_ww_ring = (int16_t *)heap_caps_malloc(
         WW_WINDOW_SAMPLES * sizeof(int16_t),
@@ -266,6 +266,7 @@ void inference_engine_init(void)
     memset(g_ww_ring,     0, WW_WINDOW_SAMPLES   * sizeof(int16_t));
     memset(g_cmd_capture, 0, CMD_CAPTURE_SAMPLES * sizeof(int16_t));
 
+    // run_static_test(); Model Test Callback
     uart_init();
 
     xTaskCreatePinnedToCore(

@@ -78,17 +78,21 @@ void ei_putchar(char c)
 /**
  *  Printf function uses vsnprintf and output using USB Serial
  */
+// __attribute__((weak)) void ei_printf(const char *format, ...) {
+//     static char print_buf[1024] = { 0 };
+
+//     va_list args;
+//     va_start(args, format);
+//     int r = vsnprintf(print_buf, sizeof(print_buf), format, args);
+//     va_end(args);
+
+//     if (r > 0) {
+//        printf(print_buf);
+//     }
+// }
+
 __attribute__((weak)) void ei_printf(const char *format, ...) {
-    static char print_buf[1024] = { 0 };
-
-    va_list args;
-    va_start(args, format);
-    int r = vsnprintf(print_buf, sizeof(print_buf), format, args);
-    va_end(args);
-
-    if (r > 0) {
-       printf(print_buf);
-    }
+    return;  // suppress EI internal printing to prevent watchdog
 }
 
 __attribute__((weak)) void ei_printf_float(float f) {
