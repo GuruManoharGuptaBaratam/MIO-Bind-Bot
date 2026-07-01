@@ -1,7 +1,8 @@
 idf_component_register(
     SRCS "src/inference_engine.cpp"
     INCLUDE_DIRS "include"
-    REQUIRES ei_model esp_driver_uart freertos esp_driver_gpio
+    REQUIRES ei_model esp_driver_uart freertos esp_driver_gpio esp_driver_i2s 
+    PRIV_REQUIRES esp_ringbuf
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE

@@ -19,9 +19,11 @@ extern "C" {
 // components/ei_model/model-parameters/model_variables.h after unzipping
 // the generated multi-impulse output. Update this value to match.
 #define WW_WINDOW_SAMPLES   16000
+#define WW_SLICE_SAMPLES    4000   // must match model_variables.h slice_size (16000/4)
 
 // Command capture: 2 seconds of audio
 #define CMD_CAPTURE_SAMPLES (IE_SAMPLE_RATE_HZ * 2)
+#define CMD_MODEL_WINDOW_SAMPLES  16000  // must match impulse_1037438_1.dsp_input_frame_size
 
 // ── Inference thresholds ──────────────────────────────────────────────────────
 #define WW_CONFIDENCE_THRESHOLD  0.85f
