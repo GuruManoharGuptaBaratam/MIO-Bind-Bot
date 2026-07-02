@@ -19,8 +19,8 @@
 #include <inttypes.h>
 
 extern const ei_impulse_t impulse_1036490_1;
-extern const ei_impulse_t impulse_1037438_1;
-extern ei_impulse_handle_t impulse_handle_1037438_1;
+extern const ei_impulse_t impulse_1037438_3;
+extern ei_impulse_handle_t impulse_handle_1037438_3;
 
 static const char *TAG = "INF_ENGINE";
 
@@ -47,12 +47,29 @@ static RingbufHandle_t s_audio_rb  = NULL; // FreeRTOS Ringbuffer
 typedef enum {
     STATE_WAKEWORD,
     STATE_CAPTURE,
-    STATE_COMMAND,
+    // STATE_COMMAND,
 } ie_state_t;
 
 static ie_state_t g_state         = STATE_WAKEWORD;
 static uint32_t   g_ww_write_pos  = 0;
-static uint32_t   g_cmd_write_pos = 0;
+
+// ── Rolling command-window classification state ─────────────────────────────
+// g_cmd_capture is a RING buffer sized to exactly one classification window
+// (CMD_MODEL_WINDOW_SAMPLES), not the full 5-second listen duration - storing
+// 5s flat (160KB) doesn't fit in internal DRAM with no PSRAM. Elapsed time for
+// the 5s timeout is tracked separately via g_cmd_total_written (a counter,
+// not a buffer size).
+static uint32_t   g_cmd_ring_pos       = 0;   // next write index into the ring, wraps at CMD_MODEL_WINDOW_SAMPLES
+static uint32_t   g_cmd_total_written  = 0;   // total samples seen since capture started (monotonic, for timeout)
+static uint32_t   g_cmd_last_check_pos = 0;   // throttles how often we classify
+static bool       g_vad_triggered      = false;  // true once real speech energy detected
+static char       g_pending_label[16]  = {0};    // last check's winning command, for consecutive-hit confirmation
+static int        g_pending_count      = 0;
+
+#define CMD_CHECK_INTERVAL_SAMPLES  4000       // check every ~0.25s of new audio
+#define VAD_ENERGY_THRESHOLD        250        // mean abs raw-sample amplitude that counts as "speech started"
+#define CMD_CONFIDENCE_MARGIN       0.15f      // best must beat 2nd-best by this much
+#define CMD_REQUIRED_CONSECUTIVE    2          // same label must win this many checks in a row
 
 // ── EI signal callbacks 
 static int ww_get_data(unsigned int offset, unsigned int length, float *out)
@@ -66,8 +83,18 @@ static int ww_get_data(unsigned int offset, unsigned int length, float *out)
 
 static int cmd_get_data(unsigned int offset, unsigned int length, float *out)
 {
+    const float GAIN = 2.0f;  // tune 1.5-3.0 based on live confidence numbers
+
     for (size_t i = 0; i < length; i++) {
-        out[i] = (float)g_cmd_capture[offset + i];   // raw int16 magnitude, matches static test convention
+        // g_cmd_ring_pos currently points at the OLDEST sample (next write slot,
+        // since the ring is exactly one window long once full) - reading forward
+        // from here with wraparound gives chronological oldest -> newest order.
+        uint32_t idx = (g_cmd_ring_pos + offset + i) % CMD_MODEL_WINDOW_SAMPLES;
+        float sample = (float)g_cmd_capture[idx];
+        sample *= GAIN;
+        if (sample >  32767.0f) sample =  32767.0f;
+        if (sample < -32768.0f) sample = -32768.0f;
+        out[i] = sample;
     }
     return 0;
 }
@@ -152,10 +179,6 @@ static void inference_task(void *arg)
     ww_signal.total_length = WW_WINDOW_SAMPLES;
     ww_signal.get_data     = &ww_get_data;
 
-    signal_t cmd_signal;
-    cmd_signal.total_length = CMD_MODEL_WINDOW_SAMPLES;   // model expects exactly 16000, not the full 2s capture
-    cmd_signal.get_data     = &cmd_get_data;
-
     size_t rb_bytes_received = 0;
 
     while (1) {
@@ -233,8 +256,13 @@ static void inference_task(void *arg)
                                 float conf = ww_result.classification[l].value;
                                 if (conf > WW_CONFIDENCE_THRESHOLD) {
                                     ESP_LOGI(TAG, "Wakeword detected (%.3f) → CAPTURE", conf);
-                                    g_cmd_write_pos = 0;
-                                    memset(g_cmd_capture, 0, CMD_CAPTURE_SAMPLES * sizeof(int16_t));
+                                    g_cmd_ring_pos       = 0;
+                                    g_cmd_total_written  = 0;
+                                    g_cmd_last_check_pos = 0;
+                                    g_vad_triggered      = false;
+                                    g_pending_label[0]   = '\0';
+                                    g_pending_count      = 0;
+                                    memset(g_cmd_capture, 0, CMD_MODEL_WINDOW_SAMPLES * sizeof(int16_t));
                                     g_state = STATE_CAPTURE;
                                 }
                                 break;
@@ -247,86 +275,116 @@ static void inference_task(void *arg)
             }
 
             case STATE_CAPTURE: {
-                uint32_t space = CMD_CAPTURE_SAMPLES - g_cmd_write_pos;
-                uint32_t copy  = ((uint32_t)current_chunk_size < space) ? (uint32_t)current_chunk_size : space;
-                
-                memcpy(&g_cmd_capture[g_cmd_write_pos], g_uart_rx_buf, copy * sizeof(int16_t));
-                g_cmd_write_pos += copy;
+                // Write into the ring buffer sample-by-sample (wraps at
+                // CMD_MODEL_WINDOW_SAMPLES); g_cmd_total_written tracks total
+                // elapsed samples since capture began, independent of ring size,
+                // used for the 5s timeout and the ~0.25s check throttle.
+                uint32_t chunk_energy_sum = 0;
+                for (int i = 0; i < current_chunk_size; i++) {
+                    int16_t s = g_uart_rx_buf[i];
+                    chunk_energy_sum += (s < 0) ? (uint32_t)(-s) : (uint32_t)s;
 
-                if (g_cmd_write_pos >= CMD_CAPTURE_SAMPLES) {
-                    ESP_LOGI(TAG, "Capture complete → COMMAND");
-                    g_state = STATE_COMMAND;
-                }
-                break;
-            }
-
-            case STATE_COMMAND: {
-                // We're not in STATE_WAKEWORD right now, so g_ww_ring is dead
-                // weight during this call — free it to maximize the largest
-                // contiguous block available for the command model's ~174KB
-                // TFLite arena, which is allocated-then-freed fresh on every
-                // single run_classifier() call (confirmed in tflite_eon.h via
-                // model_reset(ei_aligned_free)), so this window is brief.
-                if (g_ww_ring) {
-                    heap_caps_free(g_ww_ring);
-                    g_ww_ring = NULL;
+                    g_cmd_capture[g_cmd_ring_pos] = s;
+                    g_cmd_ring_pos = (g_cmd_ring_pos + 1) % CMD_MODEL_WINDOW_SAMPLES;
+                    g_cmd_total_written++;
                 }
 
-                size_t largest_free = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-                size_t total_free   = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-                ESP_LOGI(TAG, "Pre-CMD heap (WW ring freed): largest_free_block=%u bytes, total_free=%u bytes",
-                         (unsigned)largest_free, (unsigned)total_free);
-
-                ei_impulse_result_t cmd_result = {};
-                EI_IMPULSE_ERROR err = run_classifier(&impulse_handle_1037438_1, &cmd_signal, &cmd_result, false);
-
-                // Reallocate immediately — WAKEWORD state needs this buffer
-                // again right after. Reset write position since old contents
-                // are gone; next WW window fills fresh from silence.
-                g_ww_ring = (int16_t *)heap_caps_malloc(
-                    WW_WINDOW_SAMPLES * sizeof(int16_t),
-                    MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-                if (!g_ww_ring) {
-                    ESP_LOGE(TAG, "FATAL: failed to reallocate WW ring buffer after CMD classification");
+                // VAD: only start checking once real speech energy appears, instead
+                // of guessing a fixed delay - much more robust to how long the user
+                // actually pauses after the wake word.
+                if (!g_vad_triggered && current_chunk_size > 0) {
+                    uint32_t avg_energy = chunk_energy_sum / (uint32_t)current_chunk_size;
+                    if (avg_energy > VAD_ENERGY_THRESHOLD) {
+                        g_vad_triggered = true;
+                        ESP_LOGI(TAG, "VAD: speech onset detected (energy=%u)", (unsigned)avg_energy);
+                    }
                 }
-                g_ww_write_pos = 0;
 
-                if (err != EI_IMPULSE_OK) {
-                    ESP_LOGE(TAG, "CMD classifier error: %d", err);
+                bool have_full_window = (g_cmd_total_written >= CMD_MODEL_WINDOW_SAMPLES);
+                bool due_for_check    = (g_cmd_total_written - g_cmd_last_check_pos) >= CMD_CHECK_INTERVAL_SAMPLES;
+                bool window_time_out  = (g_cmd_total_written >= CMD_CAPTURE_SAMPLES);
+
+                if (have_full_window && g_vad_triggered && (due_for_check || window_time_out)) {
+                    g_cmd_last_check_pos = g_cmd_total_written;
+
+                    ei_impulse_result_t cmd_result = {};
+                    signal_t cmd_signal_local;
+                    cmd_signal_local.total_length = CMD_MODEL_WINDOW_SAMPLES;
+                    cmd_signal_local.get_data     = &cmd_get_data;
+
+                    EI_IMPULSE_ERROR err = run_classifier(&impulse_handle_1037438_3, &cmd_signal_local, &cmd_result, false);
+
+                    if (err == EI_IMPULSE_OK) {
+                        float best_conf   = 0.0f;
+                        float second_conf = 0.0f;
+                        int   best_idx    = -1;
+
+                        for (uint32_t i = 0; i < impulse_1037438_3.label_count; i++) {
+                            float v = cmd_result.classification[i].value;
+                            ESP_LOGI(TAG, "CMD [%s] = %.3f", impulse_1037438_3.categories[i], v);
+                            if (v > best_conf) {
+                                second_conf = best_conf;
+                                best_conf   = v;
+                                best_idx    = i;
+                            } else if (v > second_conf) {
+                                second_conf = v;
+                            }
+                        }
+
+                        bool margin_ok = (best_conf - second_conf) >= CMD_CONFIDENCE_MARGIN;
+
+                        if (best_idx >= 0 && best_conf > CMD_CONFIDENCE_THRESHOLD && margin_ok) {
+                            const char *label = cmd_result.classification[best_idx].label;
+
+                            uint8_t cmd_byte = 0x00;
+                            if      (strcmp(label, "kansei") == 0) cmd_byte = 0x01;
+                            else if (strcmp(label, "kiroku") == 0) cmd_byte = 0x02;
+                            else if (strcmp(label, "ibasho") == 0) cmd_byte = 0x03;
+
+                            if (cmd_byte != 0x00) {
+                                // Track consecutive agreeing checks before acting - filters
+                                // out one-off misfires from a single noisy window.
+                                if (strcmp(g_pending_label, label) == 0) {
+                                    g_pending_count++;
+                                } else {
+                                    strncpy(g_pending_label, label, sizeof(g_pending_label) - 1);
+                                    g_pending_label[sizeof(g_pending_label) - 1] = '\0';
+                                    g_pending_count = 1;
+                                }
+
+                                ESP_LOGI(TAG, "Tentative: %s (%.3f) x%d", label, best_conf, g_pending_count);
+
+                                if (g_pending_count >= CMD_REQUIRED_CONSECUTIVE) {
+                                    ESP_LOGI(TAG, "COMMAND DETECTED: %s (%.3f)", label, best_conf);
+                                    uint8_t pkt[3] = { 0xAA, cmd_byte, static_cast<uint8_t>(0xAA ^ cmd_byte) };
+                                    uart_write_bytes(IE_UART_NUM, (const char *)pkt, sizeof(pkt));
+                                    ESP_LOGI(TAG, "Sent packet to core [AA %02X %02X]", cmd_byte, pkt[2]);
+
+                                    g_state = STATE_WAKEWORD;
+                                    break;
+                                }
+                            } else {
+                                // "unknown" crossed threshold - not a real command, reset any
+                                // pending streak and keep listening within the 5s window.
+                                ESP_LOGI(TAG, "High-confidence unknown (%.3f) - still listening", best_conf);
+                                g_pending_label[0] = '\0';
+                                g_pending_count    = 0;
+                            }
+                        } else {
+                            // Low confidence or ambiguous (no clear margin) - don't let a
+                            // weak/uncertain check count toward the pending streak.
+                            g_pending_label[0] = '\0';
+                            g_pending_count    = 0;
+                        }
+                    } else {
+                        ESP_LOGE(TAG, "CMD classifier error: %d", err);
+                    }
+                }
+
+                if (window_time_out && g_state != STATE_WAKEWORD) {
+                    ESP_LOGI(TAG, "5s command window expired, no match → WAKEWORD");
                     g_state = STATE_WAKEWORD;
-                    break;
                 }
-
-                float   best_conf  = 0.0f;
-                int     best_idx   = -1;
-                
-                for (uint32_t i = 0; i < impulse_1037438_1.label_count; i++) {
-                    ESP_LOGI(TAG, "CMD [%s] = %.3f", impulse_1037438_1.categories[i], cmd_result.classification[i].value);
-                    if (cmd_result.classification[i].value > best_conf) {
-                        best_conf = cmd_result.classification[i].value;
-                        best_idx = i;
-                    }
-                }
-
-                if (best_idx >= 0 && best_conf > CMD_CONFIDENCE_THRESHOLD) {
-                    const char *label = cmd_result.classification[best_idx].label;
-                    ESP_LOGI(TAG, "COMMAND DETECTED: %s (%.3f)", label, best_conf);
-
-                    uint8_t cmd_byte = 0x00;
-                    if      (strcmp(label, "kansei") == 0) cmd_byte = 0x01;
-                    else if (strcmp(label, "kiroku") == 0) cmd_byte = 0x02;
-                    else if (strcmp(label, "ibasho") == 0) cmd_byte = 0x03;
-
-                    if (cmd_byte != 0x00) {
-                        uint8_t pkt[3] = { 0xAA, cmd_byte, static_cast<uint8_t>(0xAA ^ cmd_byte) };
-                        uart_write_bytes(IE_UART_NUM, (const char *)pkt, sizeof(pkt));
-                        ESP_LOGI(TAG, "Sent packet to core [AA %02X %02X]", cmd_byte, pkt[2]);
-                    }
-                } else {
-                    ESP_LOGI(TAG, "No command above threshold (best=%.3f)", best_conf);
-                }
-
-                g_state = STATE_WAKEWORD;
                 break;
             }
             }
@@ -352,8 +410,11 @@ void inference_engine_init(void)
         WW_WINDOW_SAMPLES * sizeof(int16_t),
         MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
 
+    // g_cmd_capture is a ring buffer sized to exactly one classification
+    // window (32KB), not the full 5s listen duration (which would be 160KB -
+    // too large for a single contiguous internal-DRAM allocation with no PSRAM).
     g_cmd_capture = (int16_t *)heap_caps_malloc(
-        CMD_CAPTURE_SAMPLES * sizeof(int16_t),
+        CMD_MODEL_WINDOW_SAMPLES * sizeof(int16_t),
         MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
 
     g_uart_rx_buf = (int16_t *)heap_caps_malloc(
@@ -364,8 +425,8 @@ void inference_engine_init(void)
     configASSERT(g_cmd_capture);
     configASSERT(g_uart_rx_buf);
 
-    memset(g_ww_ring,     0, WW_WINDOW_SAMPLES   * sizeof(int16_t));
-    memset(g_cmd_capture, 0, CMD_CAPTURE_SAMPLES * sizeof(int16_t));
+    memset(g_ww_ring,     0, WW_WINDOW_SAMPLES        * sizeof(int16_t));
+    memset(g_cmd_capture, 0, CMD_MODEL_WINDOW_SAMPLES  * sizeof(int16_t));
 
     uart_init();       // Outbound signaling UART initialization
     i2s_slave_init();  // Inbound streaming I2S Audio receiver initialization
