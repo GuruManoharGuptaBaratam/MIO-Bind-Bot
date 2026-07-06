@@ -60,6 +60,101 @@ static uint32_t   g_cmd_write_pos       = 0;
 static uint32_t   g_cmd_delay_counter   = 0;
 static uint32_t   g_countdown_counter   = 0;
 
+// ─────────────────────────────────────────────────────────────────────────
+// WAKEWORD MODEL — continuous streaming speed-change
+// Ported EXACTLY from the stretch_audio_stream() logic that used to live in
+// hfp_manager.c. hfp_manager now forwards raw, unmodified audio only; this
+// streaming stretch runs here instead, right before samples are written
+// into g_ww_ring. Kept as its own, separate copy/state (not shared with the
+// command-model stretch below) even though the underlying goal is the same.
+//
+// STRETCH_RATIO 1.5 => every 2 input samples become 3 output samples =>
+// audio takes 1.5x as long = ~0.667x speed. Carries one sample of lookback
+// + a fractional position across calls so there's no click/discontinuity
+// at chunk boundaries.
+#define WW_STRETCH_RATIO        1.5f
+#define WW_STRETCH_STEP         (1.0f / WW_STRETCH_RATIO)   // ~0.6667 input-samples per output-sample
+#define WW_STRETCH_SCRATCH_LEN  800                          // int16 samples of headroom per CHUNK_SAMPLES call
+
+static float   s_ww_stretch_pos     = 0.0f;
+static int16_t s_ww_stretch_prev    = 0;
+static bool    s_ww_stretch_primed  = false;
+
+// Slows incoming 16-bit PCM by WW_STRETCH_RATIO. Call once per incoming
+// chunk, in order — state persists between calls (continuous stream).
+// Returns number of bytes written to out_buf (always a whole number of
+// int16 samples).
+static uint32_t ww_stretch_audio_stream(const uint8_t *in_buf, uint32_t in_len,
+                                         uint8_t *out_buf, uint32_t out_buf_cap_bytes)
+{
+    const int16_t *in_samples = (const int16_t *)in_buf;
+    uint32_t in_count = in_len / sizeof(int16_t);
+    int16_t *out_samples = (int16_t *)out_buf;
+    uint32_t out_cap = out_buf_cap_bytes / sizeof(int16_t);
+    uint32_t out_count = 0;
+
+    for (uint32_t i = 0; i < in_count; i++) {
+        int16_t cur = in_samples[i];
+
+        if (!s_ww_stretch_primed) {
+            // Very first sample ever seen — nothing to interpolate against yet.
+            s_ww_stretch_prev = cur;
+            s_ww_stretch_primed = true;
+            continue;
+        }
+
+        while (s_ww_stretch_pos < 1.0f) {
+            if (out_count >= out_cap) {
+                // Scratch buffer exhausted — bail safely rather than
+                // overrun the caller's buffer.
+                return out_count * sizeof(int16_t);
+            }
+            float frac = s_ww_stretch_pos;
+            float value = (float)s_ww_stretch_prev + ((float)cur - (float)s_ww_stretch_prev) * frac;
+            out_samples[out_count++] = (int16_t)value;
+            s_ww_stretch_pos += WW_STRETCH_STEP;
+        }
+        s_ww_stretch_pos -= 1.0f;
+        s_ww_stretch_prev = cur;
+    }
+
+    return out_count * sizeof(int16_t);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// COMMAND MODEL — one-shot 1.0s capture -> 1.5s stretch
+// Ported EXACTLY (same interpolation math) from the offline stretch in
+// audio_speech_change_hfp_manager_.c. Instead of a full 1.0-second capture
+// arriving already stretched over I2S, the raw 1.0s (16000 samples) is
+// captured here and stretched in one shot into the 1.5s (24000 sample)
+// command buffer right before classification. Kept as its own separate
+// copy/state (not shared with the wakeword stretch above).
+#define CMD_RAW_CAPTURE_SAMPLES   16000   // 1.0 second raw capture at 16kHz
+#define CMD_FINAL_OUTPUT_SAMPLES  24000   // stretched to 1.5 seconds (== CMD_CAPTURE_SAMPLES)
+
+static int16_t *g_cmd_raw_capture = NULL; // raw 1.0s capture buffer (pre-stretch)
+
+// Stretches exactly CMD_RAW_CAPTURE_SAMPLES raw samples across
+// CMD_FINAL_OUTPUT_SAMPLES output samples via linear interpolation across
+// the whole buffer (same "step"/idx/frac formula as the offline test code).
+static void cmd_stretch_capture_to_output(const int16_t *raw_input, int16_t *stretched_out)
+{
+    // Maps CMD_FINAL_OUTPUT_SAMPLES output samples smoothly across the
+    // entire CMD_RAW_CAPTURE_SAMPLES input pool. Last output index maps
+    // exactly to the last input index.
+    float step = (float)(CMD_RAW_CAPTURE_SAMPLES - 1) / (float)(CMD_FINAL_OUTPUT_SAMPLES - 1);
+
+    for (int i = 0; i < CMD_FINAL_OUTPUT_SAMPLES; i++) {
+        float pos = i * step;
+        uint32_t idx = (uint32_t)pos;
+        float frac = pos - (float)idx;
+
+        int16_t s0 = raw_input[idx];
+        int16_t s1 = (idx + 1 < CMD_RAW_CAPTURE_SAMPLES) ? raw_input[idx + 1] : raw_input[idx];
+        stretched_out[i] = (int16_t)(s0 + (s1 - s0) * frac);
+    }
+}
+
 // ── EI signal callbacks 
 static int ww_get_data(unsigned int offset, unsigned int length, float *out)
 {
@@ -197,8 +292,21 @@ static void inference_task(void *arg)
             switch (g_state) {
 
             case STATE_WAKEWORD: {
-                for (int i = 0; i < current_chunk_size; i++) {
-                    g_ww_ring[g_ww_write_pos % WW_WINDOW_SAMPLES] = g_uart_rx_buf[i];
+                // Apply the continuous streaming speed-change (1.5x) to this
+                // chunk of raw, direct audio BEFORE it is written into the
+                // wakeword ring buffer. This is the same logic that used to
+                // run inside hfp_manager.c, just relocated here.
+                uint8_t ww_stretched_buf[WW_STRETCH_SCRATCH_LEN * sizeof(int16_t)];
+                uint32_t ww_stretched_len = ww_stretch_audio_stream(
+                    (const uint8_t *)g_uart_rx_buf,
+                    current_chunk_size * sizeof(int16_t),
+                    ww_stretched_buf,
+                    sizeof(ww_stretched_buf));
+                int16_t *ww_stretched_samples = (int16_t *)ww_stretched_buf;
+                int ww_stretched_count = ww_stretched_len / sizeof(int16_t);
+
+                for (int i = 0; i < ww_stretched_count; i++) {
+                    g_ww_ring[g_ww_write_pos % WW_WINDOW_SAMPLES] = ww_stretched_samples[i];
                     g_ww_write_pos++;
 
                     if (g_ww_write_pos >= WW_WINDOW_SAMPLES && (g_ww_write_pos % WW_SLICE_SAMPLES) == 0) {
@@ -253,8 +361,10 @@ static void inference_task(void *arg)
                     }
 
                     if (g_countdown_counter >= (3 * AUDIO_SAMPLE_RATE)) {
-                        ESP_LOGI(TAG, "★★★ RECORDING STARTED - SPEAK NOW (1.5 Sec Window) ★★★");
-                        memset(g_cmd_ring, 0, CMD_CAPTURE_SAMPLES * sizeof(int16_t));
+                        ESP_LOGI(TAG, "★★★ RECORDING STARTED - SPEAK NOW (1.0 Sec Raw Capture) ★★★");
+                        // Capture raw (unstretched) audio first; the 1.0s -> 1.5s
+                        // stretch happens as a one-shot step once capture completes.
+                        memset(g_cmd_raw_capture, 0, CMD_RAW_CAPTURE_SAMPLES * sizeof(int16_t));
                         g_cmd_write_pos = 0;
                         g_state = STATE_COMMAND_CAPTURE;
                         break;
@@ -265,21 +375,26 @@ static void inference_task(void *arg)
 
             case STATE_COMMAND_CAPTURE: {
                 for (int i = 0; i < current_chunk_size; i++) {
-                    g_cmd_ring[g_cmd_write_pos] = g_uart_rx_buf[i];
+                    // Fill the raw 1.0s capture buffer directly with the
+                    // unmodified audio arriving from hfp_manager — no
+                    // stretching during capture, matching
+                    // audio_speech_change_hfp_manager_.c exactly.
+                    g_cmd_raw_capture[g_cmd_write_pos] = g_uart_rx_buf[i];
                     g_cmd_write_pos++;
 
-                    // Frame fully captured
-                    if (g_cmd_write_pos >= CMD_CAPTURE_SAMPLES) {
-                        ESP_LOGI(TAG, "Recording completed. Evaluating audio signal frame...");
+                    // Frame fully captured (1.0 second of raw audio)
+                    if (g_cmd_write_pos >= CMD_RAW_CAPTURE_SAMPLES) {
+                        ESP_LOGI(TAG, "Raw capture completed. Evaluating audio signal frame...");
 
                         // 1. Zeros Threshold Verification (Check if frame is > 75% silent/zeroed out)
+                        //    Checked on the raw capture, before spending time stretching it.
                         uint32_t zero_count = 0;
-                        for (uint32_t s = 0; s < CMD_CAPTURE_SAMPLES; s++) {
-                            if (g_cmd_ring[s] == 0) {
+                        for (uint32_t s = 0; s < CMD_RAW_CAPTURE_SAMPLES; s++) {
+                            if (g_cmd_raw_capture[s] == 0) {
                                 zero_count++;
                             }
                         }
-                        float zero_ratio = (float)zero_count / CMD_CAPTURE_SAMPLES;
+                        float zero_ratio = (float)zero_count / CMD_RAW_CAPTURE_SAMPLES;
                         if (zero_ratio >= 0.75f) {
                             ESP_LOGW(TAG, "Captured buffer dropped: %.1f%% zeros detected. Returning to WAKEWORD.", zero_ratio * 100.0f);
                             memset(g_ww_ring, 0, WW_WINDOW_SAMPLES * sizeof(int16_t));
@@ -288,6 +403,11 @@ static void inference_task(void *arg)
                             break;
                         }
 
+                        // 2. One-shot 1.0s -> 1.5s stretch (ported exactly from
+                        //    audio_speech_change_hfp_manager_.c) into g_cmd_ring,
+                        //    which is what the command model actually classifies.
+                        ESP_LOGI(TAG, "Processing 0.66x stretch to exactly %d features...", CMD_FINAL_OUTPUT_SAMPLES);
+                        cmd_stretch_capture_to_output(g_cmd_raw_capture, g_cmd_ring);
 
                         // 3. Perform Single Discrete Inference Run
                         ei_impulse_result_t cmd_result = {};
@@ -369,8 +489,15 @@ void inference_engine_init(void)
         MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
 
     // Adjusted sizing configuration explicitly for 1.5 seconds frame storage
+    // (this is the final, stretched buffer fed to the command classifier)
     g_cmd_ring = (int16_t *)heap_caps_malloc(
         CMD_CAPTURE_SAMPLES * sizeof(int16_t),
+        MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+
+    // Raw 1.0-second capture buffer (pre-stretch), used only by the command
+    // model's one-shot capture/stretch pipeline.
+    g_cmd_raw_capture = (int16_t *)heap_caps_malloc(
+        CMD_RAW_CAPTURE_SAMPLES * sizeof(int16_t),
         MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
 
     g_uart_rx_buf = (int16_t *)heap_caps_malloc(
@@ -379,10 +506,12 @@ void inference_engine_init(void)
 
     configASSERT(g_ww_ring);
     configASSERT(g_cmd_ring);
+    configASSERT(g_cmd_raw_capture);
     configASSERT(g_uart_rx_buf);
 
     memset(g_ww_ring,  0, WW_WINDOW_SAMPLES   * sizeof(int16_t));
     memset(g_cmd_ring, 0, CMD_CAPTURE_SAMPLES * sizeof(int16_t));
+    memset(g_cmd_raw_capture, 0, CMD_RAW_CAPTURE_SAMPLES * sizeof(int16_t));
 
     uart_init();       
     i2s_slave_init();  
