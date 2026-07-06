@@ -28,22 +28,22 @@
  * either express or implied. See the License for the specific language governing
  * permissions, disclaimers and limitations under the License.
  */
-
+ 
 #ifndef _EI_CLASSIFIER_MODEL_METADATA_H_
 #define _EI_CLASSIFIER_MODEL_METADATA_H_
-
+ 
 /**
 * @file
 *  Auto-generated global deployment macros.
 *  model_metadata.h defines if certain functions are enabled or disabled in the whole project.
 */
-
+ 
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-
+ 
 #include "edge-impulse-sdk/classifier/ei_constants.h"
-
+ 
 #define EI_CLASSIFIER_NONE                       255
 #define EI_CLASSIFIER_UTENSOR                    1
 #define EI_CLASSIFIER_TFLITE                     2
@@ -62,7 +62,7 @@
 #define EI_CLASSIFIER_CEVA_NPN                   15
 #define EI_CLASSIFIER_NORDIC_AXON                16
 #define EI_CLASSIFIER_VLM_CONNECTOR              17
-
+ 
 #define EI_CLASSIFIER_SENSOR_UNKNOWN             255
 #define EI_CLASSIFIER_SENSOR_MICROPHONE          1
 #define EI_CLASSIFIER_SENSOR_ACCELEROMETER       2
@@ -70,7 +70,7 @@
 #define EI_CLASSIFIER_SENSOR_9DOF                4
 #define EI_CLASSIFIER_SENSOR_ENVIRONMENTAL       5
 #define EI_CLASSIFIER_SENSOR_FUSION              6
-
+ 
 #define EI_ANOMALY_TYPE_UNKNOWN                  0
 #define EI_ANOMALY_TYPE_KMEANS                   1
 #define EI_ANOMALY_TYPE_GMM                      2
@@ -78,18 +78,18 @@
 #define EI_ANOMALY_TYPE_VISUAL_PATCHCORE         4
 #define EI_ANOMALY_TYPE_CUSTOM                   5
 #define EI_ANOMALY_TYPE_VISUAL_CUSTOM            6
-
+ 
 // These must match the enum values in TensorFlow Lite's "TfLiteType"
 #define EI_CLASSIFIER_DATATYPE_FLOAT32           1
 #define EI_CLASSIFIER_DATATYPE_UINT8             3
 #define EI_CLASSIFIER_DATATYPE_INT8              9
-
+ 
 #define EI_CLASSIFIER_PROJECT_ID                 1037438
 #define EI_CLASSIFIER_PROJECT_OWNER              "GuruManohar"
 #define EI_CLASSIFIER_PROJECT_NAME               "MIO-CommandWord"
-#define EI_CLASSIFIER_PROJECT_DEPLOY_VERSION     8
-#define EI_CLASSIFIER_NN_INPUT_FRAME_SIZE        3960
-#define EI_CLASSIFIER_RAW_SAMPLE_COUNT           16000
+#define EI_CLASSIFIER_PROJECT_DEPLOY_VERSION     22
+#define EI_CLASSIFIER_NN_INPUT_FRAME_SIZE        5920
+#define EI_CLASSIFIER_RAW_SAMPLE_COUNT           24000
 #define EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME      1
 #define EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE       (EI_CLASSIFIER_RAW_SAMPLE_COUNT * EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME)
 #define EI_CLASSIFIER_INPUT_WIDTH                0
@@ -99,46 +99,46 @@
 #define EI_CLASSIFIER_INTERVAL_MS                0.0625
 #define EI_CLASSIFIER_NN_OUTPUT_COUNT            4
 #define EI_CLASSIFIER_LABEL_COUNT                4
-#define EI_CLASSIFIER_SINGLE_FEATURE_INPUT       EI_CLASSIFIER_LAST_LAYER_SSD
+#define EI_CLASSIFIER_SINGLE_FEATURE_INPUT       1
 #define EI_CLASSIFIER_FREQUENCY                  16000
 #define EI_CLASSIFIER_SENSOR                     EI_CLASSIFIER_SENSOR_MICROPHONE
 #define EI_CLASSIFIER_FUSION_AXES_STRING         "audio"
 #define EI_CLASSIFIER_HAS_ANOMALY                EI_ANOMALY_TYPE_UNKNOWN
-
+ 
 #define EI_CLASSIFIER_TFLITE_INPUT_DATATYPE      EI_CLASSIFIER_DATATYPE_INT8
 #define EI_CLASSIFIER_TFLITE_OUTPUT_DATATYPE     EI_CLASSIFIER_DATATYPE_INT8
-
+ 
 #define EI_CLASSIFIER_THRESHOLD                  0.6
 #define EI_CLASSIFIER_TFLITE_OUTPUT_DATA_TENSOR    0
 #define EI_CLASSIFIER_OBJECT_DETECTION_LAST_LAYER  EI_CLASSIFIER_LAST_LAYER_UNKNOWN
-
-#define EI_CLASSIFIER_HAS_FFT_INFO               EI_CLASSIFIER_LAST_LAYER_SSD
-#define EI_CLASSIFIER_LOAD_FFT_32                EI_CLASSIFIER_LAST_LAYER_UNKNOWN
-#define EI_CLASSIFIER_LOAD_FFT_64                EI_CLASSIFIER_LAST_LAYER_UNKNOWN
-#define EI_CLASSIFIER_LOAD_FFT_128               EI_CLASSIFIER_LAST_LAYER_UNKNOWN
-#define EI_CLASSIFIER_LOAD_FFT_256               EI_CLASSIFIER_LAST_LAYER_SSD
-#define EI_CLASSIFIER_LOAD_FFT_512               EI_CLASSIFIER_LAST_LAYER_UNKNOWN
-#define EI_CLASSIFIER_LOAD_FFT_1EI_CLASSIFIER_LAST_LAYER_UNKNOWN24              EI_CLASSIFIER_LAST_LAYER_UNKNOWN
-#define EI_CLASSIFIER_LOAD_FFT_2EI_CLASSIFIER_LAST_LAYER_UNKNOWN48              EI_CLASSIFIER_LAST_LAYER_UNKNOWN
-#define EI_CLASSIFIER_LOAD_FFT_4EI_CLASSIFIER_LAST_LAYER_UNKNOWN96              EI_CLASSIFIER_LAST_LAYER_UNKNOWN
-#define EI_CLASSIFIER_NON_STANDARD_FFT_SIZES     EI_CLASSIFIER_LAST_LAYER_UNKNOWN
-
+ 
+#define EI_CLASSIFIER_HAS_FFT_INFO               1
+#define EI_CLASSIFIER_LOAD_FFT_32                0
+#define EI_CLASSIFIER_LOAD_FFT_64                0
+#define EI_CLASSIFIER_LOAD_FFT_128               0
+#define EI_CLASSIFIER_LOAD_FFT_256               1
+#define EI_CLASSIFIER_LOAD_FFT_512               0
+#define EI_CLASSIFIER_LOAD_FFT_1024              0
+#define EI_CLASSIFIER_LOAD_FFT_2048              0
+#define EI_CLASSIFIER_LOAD_FFT_4096              0
+#define EI_CLASSIFIER_NON_STANDARD_FFT_SIZES     0
+ 
 #define EI_DSP_PARAMS_GENERATED                  1
-
+ 
 #define EI_CLASSIFIER_INFERENCING_ENGINE            EI_CLASSIFIER_TFLITE
 #define EI_CLASSIFIER_COMPILED                      1
 #define EI_CLASSIFIER_HAS_TFLITE_OPS_RESOLVER       0
-#define EI_CLASSIFIER_QUANTIZATION_ENABLED          EI_CLASSIFIER_LAST_LAYER_SSD
-#define EI_CLASSIFIER_HAS_VISUAL_ANOMALY           -1
+#define EI_CLASSIFIER_QUANTIZATION_ENABLED          1
+#define EI_CLASSIFIER_HAS_VISUAL_ANOMALY            0
 #define EI_CLASSIFIER_HAS_MODEL_VARIABLES           1
 #define EI_CLASSIFIER_HAS_DATA_NORMALIZATION        0
 #define EI_CLASSIFIER_CALIBRATION_ENABLED           0
 #define EI_CLASSIFIER_OBJECT_TRACKING_ENABLED       0
-#define EI_CLASSIFIER_TFLITE_LARGEST_ARENA_SIZE     162284
-#define EI_CLASSIFIER_LOAD_IMAGE_SCALING            EI_CLASSIFIER_LAST_LAYER_UNKNOWN
+#define EI_CLASSIFIER_TFLITE_LARGEST_ARENA_SIZE     18899
+#define EI_CLASSIFIER_LOAD_IMAGE_SCALING            0
 #define EI_CLASSIFIER_DSP_AXES_INDEX_TYPE           uint8_t
 #define EI_CLASSIFIER_HR_ENABLED                    0
-#define EI_CLASSIFIER_EEG_ENABLED                   0
+#define EI_CLASSIFIER_EEG_ENABLED                    0
 #define EI_CLASSIFIER_OBJECT_DETECTION              0
 #define EI_CLASSIFIER_FREEFORM_OUTPUT               0
 #define EI_CLASSIFIER_HAS_ANOMALY_KMEANS            0
@@ -148,7 +148,7 @@
 #define EI_CLASSIFIER_HAS_ANOMALY_VISUAL_CUSTOM     0
 #define EI_CLASSIFIER_HAS_ANOMALY_CUSTOM            0
 #define EI_CLASSIFIER_LOAD_ANOMALY_H                0
-
+ 
 #define EI_HAS_SSD                                  0
 #define EI_HAS_FOMO                                 0
 #define EI_HAS_YOLOV5                               0
@@ -164,41 +164,41 @@
 #define EI_HAS_QC_FACE_DET_LITE                     0
 #define EI_HAS_PADDLEOCR_DETECTOR                   0
 #define EI_HAS_QC_YOLOX                             0
-
+ 
 #ifndef EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW
 #define EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW    4
 #endif // EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW
-
+ 
 #define EI_CLASSIFIER_SLICE_SIZE                 (EI_CLASSIFIER_RAW_SAMPLE_COUNT / EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW)
-
+ 
 #define EI_STUDIO_VERSION_MAJOR             1
 #define EI_STUDIO_VERSION_MINOR             93
-#define EI_STUDIO_VERSION_PATCH             18
-
+#define EI_STUDIO_VERSION_PATCH             21
+ 
 #if ((EI_CLASSIFIER_INFERENCING_ENGINE == EI_CLASSIFIER_TFLITE) ||      (EI_CLASSIFIER_INFERENCING_ENGINE == EI_CLASSIFIER_DRPAI)) &&      EI_CLASSIFIER_USE_FULL_TFLITE == 1
-
+ 
 #if EI_CLASSIFIER_INFERENCING_ENGINE == EI_CLASSIFIER_TFLITE
 #undef EI_CLASSIFIER_INFERENCING_ENGINE
 #define EI_CLASSIFIER_INFERENCING_ENGINE          EI_CLASSIFIER_TFLITE_FULL
 #endif
-
+ 
 #undef EI_CLASSIFIER_HAS_TFLITE_OPS_RESOLVER
 #define EI_CLASSIFIER_HAS_TFLITE_OPS_RESOLVER     0
-
+ 
 #if EI_CLASSIFIER_COMPILED == 1
 #error "You cannot use models created with the EON Compiler with full TensorFlow Lite / LiteRT (you're building with EI_CLASSIFIER_USE_FULL_TFLITE=1). In the Studio, under Deployment choose 'C++ library (Linux)' as your deployment option, or set 'TensorFlow Lite' as your inference engine, to get a library that's compatible. Alternatively, build with EI_CLASSIFIER_USE_FULL_TFLITE=0 (this will be much slower)."
 #endif
 #endif // ((EI_CLASSIFIER_INFERENCING_ENGINE == EI_CLASSIFIER_TFLITE) || (EI_CLASSIFIER_INFERENCING_ENGINE == EI_CLASSIFIER_DRPAI)) && EI_CLASSIFIER_USE_FULL_TFLITE == 1
-
+ 
 #if (EI_CLASSIFIER_INFERENCING_ENGINE == EI_CLASSIFIER_TFLITE) && (EI_CLASSIFIER_COMPILED != 1) && (EI_CLASSIFIER_TFLITE_LARGEST_ARENA_SIZE == 0)
 #error "This model cannot run under TensorFlow Lite Micro (EI_CLASSIFIER_TFLITE_LARGEST_ARENA_SIZE is 0). See https://github.com/edgeimpulse/example-standalone-inferencing-linux (build with EI_CLASSIFIER_USE_FULL_TFLITE=1) to use full TensorFlow Lite / LiteRT."
 #endif
-
+ 
 typedef struct {
     const char *name;
     int axis;
 } ei_dsp_named_axis_t;
-
+ 
 typedef struct {
     uint32_t block_id;
     uint16_t implementation_version;
@@ -213,7 +213,7 @@ typedef struct {
     bool kurtosis;
     int moving_avg_num_windows;
 } ei_dsp_config_flatten_t;
-
+ 
 typedef struct {
     uint32_t block_id;
     uint16_t implementation_version;
@@ -222,7 +222,7 @@ typedef struct {
     size_t named_axes_size;
     const char * channels;
 } ei_dsp_config_image_t;
-
+ 
 typedef struct {
     uint32_t block_id;
     uint16_t implementation_version;
@@ -240,7 +240,7 @@ typedef struct {
     float pre_cof;
     int pre_shift;
 } ei_dsp_config_mfcc_t;
-
+ 
 typedef struct {
     uint32_t block_id;
     uint16_t implementation_version;
@@ -256,14 +256,14 @@ typedef struct {
     int win_size;
     int noise_floor_db;
 } ei_dsp_config_mfe_t;
-
+ 
 typedef struct {
     uint32_t block_id;
     uint16_t implementation_version;
     int axes;
     float scale_axes;
 } ei_dsp_config_raw_t;
-
+ 
 typedef struct {
     uint32_t block_id;
     uint16_t implementation_version;
@@ -284,7 +284,7 @@ typedef struct {
     const char * wavelet;
     bool extra_low_freq;
 } ei_dsp_config_spectral_analysis_t;
-
+ 
 typedef struct {
     uint32_t block_id;
     uint16_t implementation_version;
@@ -297,7 +297,7 @@ typedef struct {
     int noise_floor_db;
     bool show_axes;
 } ei_dsp_config_spectrogram_t;
-
+ 
 typedef struct {
     uint32_t block_id;
     uint16_t implementation_version;
@@ -313,7 +313,7 @@ typedef struct {
     float pre_cof;
     const char * extractor;
 } ei_dsp_config_audio_syntiant_t;
-
+ 
 typedef struct {
     uint32_t block_id;
     uint16_t implementation_version;
@@ -322,7 +322,7 @@ typedef struct {
     bool scaling_raw;
     bool padding;
 } ei_dsp_config_imu_syntiant_t;
-
+ 
 typedef struct {
     uint32_t block_id;
     uint16_t implementation_version;
@@ -339,7 +339,7 @@ typedef struct {
     float hrv_update_interval_s;
     float hrv_win_size_s;
 } ei_dsp_config_hr_t;
-
+ 
 typedef struct {
     uint32_t block_id;
     uint16_t implementation_version;
@@ -351,9 +351,9 @@ typedef struct {
     float motion_sensitivity;
     float epoch_length;
 } ei_dsp_config_eeg_t;
-
+ 
 typedef struct {
     int:0;
 } ei_post_processing_output_t;
-
+ 
 #endif // _EI_CLASSIFIER_MODEL_METADATA_H_

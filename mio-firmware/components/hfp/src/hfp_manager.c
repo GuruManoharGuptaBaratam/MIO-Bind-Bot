@@ -30,6 +30,69 @@ static volatile bool s_sco_connected = false;
 static uint8_t s_loopback_buf[120] = {0};
 static uint32_t s_loopback_len = 0;
 
+// ── Continuous speed-reduction (time-stretch) for the inference-bound copy ──
+// Ported from the offline 1.0s -> 1.5s linear-interpolation stretch validated
+// in audio_speech_change_hfp_manager_.c (16000 samples -> 24000 samples),
+// reworked into a sample-by-sample STREAMING form so it runs continuously on
+// live HFP packets instead of needing a full 1-second block captured first.
+// It carries one sample of lookback + a fractional position across calls, so
+// there's no click/discontinuity at packet boundaries.
+//
+// STRETCH_RATIO 1.5 => every 2 input samples become 3 output samples =>
+// played back at the same 16kHz rate, audio takes 1.5x as long = ~0.667x
+// speed. This matches the ratio already confirmed to fix command detection.
+// Only this copy is slowed — the phone-call sidetone/loopback below is fed
+// from the original, unstretched packet and is completely unaffected.
+#define STRETCH_RATIO        1.5f
+#define STRETCH_STEP         (1.0f / STRETCH_RATIO)   // ~0.6667 input-samples per output-sample
+#define STRETCH_SCRATCH_LEN  256                        // int16 samples of headroom per callback
+
+static float   s_stretch_pos     = 0.0f;
+static int16_t s_stretch_prev    = 0;
+static bool    s_stretch_primed  = false;
+
+// Slows incoming 16-bit PCM by STRETCH_RATIO. Call once per incoming HFP
+// packet, in order — state persists between calls (continuous stream).
+// Returns number of bytes written to out_buf (always a whole number of
+// int16 samples).
+static uint32_t stretch_audio_stream(const uint8_t *in_buf, uint32_t in_len,
+                                      uint8_t *out_buf, uint32_t out_buf_cap_bytes)
+{
+    const int16_t *in_samples = (const int16_t *)in_buf;
+    uint32_t in_count = in_len / sizeof(int16_t);
+    int16_t *out_samples = (int16_t *)out_buf;
+    uint32_t out_cap = out_buf_cap_bytes / sizeof(int16_t);
+    uint32_t out_count = 0;
+
+    for (uint32_t i = 0; i < in_count; i++) {
+        int16_t cur = in_samples[i];
+
+        if (!s_stretch_primed) {
+            // Very first sample ever seen — nothing to interpolate against yet.
+            s_stretch_prev = cur;
+            s_stretch_primed = true;
+            continue;
+        }
+
+        while (s_stretch_pos < 1.0f) {
+            if (out_count >= out_cap) {
+                // Scratch buffer exhausted — should not happen at normal HFP
+                // packet sizes (~<=120 bytes), but bail safely rather than
+                // overrun the caller's buffer.
+                return out_count * sizeof(int16_t);
+            }
+            float frac = s_stretch_pos;
+            float value = (float)s_stretch_prev + ((float)cur - (float)s_stretch_prev) * frac;
+            out_samples[out_count++] = (int16_t)value;
+            s_stretch_pos += STRETCH_STEP;
+        }
+        s_stretch_pos -= 1.0f;
+        s_stretch_prev = cur;
+    }
+
+    return out_count * sizeof(int16_t);
+}
+
 static const char *TAG = "MIO_HFP";
 
 static esp_bd_addr_t g_remote_bda = {0};
@@ -101,8 +164,18 @@ static void incoming_data_callback(const uint8_t *buf, uint32_t len)
     // Non-blocking push into the smoothing ring buffer. If it's full
     // (feeder task falling behind), drop this packet rather than block
     // the BT callback context.
-    if (xRingbufferSend(s_audio_rb, buf, len, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "Audio ring buffer full — dropped %lu bytes", (unsigned long)len);
+    //
+    // Only the inference-bound copy is slowed down — this is the copy that
+    // ends up on I2S -> Inference ESP32. The sidetone copy above (already
+    // captured into s_loopback_buf from the original, unstretched `buf`)
+    // is untouched, so the caller still hears themselves at normal speed.
+    uint8_t stretched_buf[STRETCH_SCRATCH_LEN * sizeof(int16_t)];
+    uint32_t stretched_len = stretch_audio_stream(buf, len, stretched_buf, sizeof(stretched_buf));
+
+    if (stretched_len > 0) {
+        if (xRingbufferSend(s_audio_rb, stretched_buf, stretched_len, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "Audio ring buffer full — dropped %lu bytes", (unsigned long)stretched_len);
+        }
     }
 
     // This must be paced by the real SCO air-interface cadence, not by our

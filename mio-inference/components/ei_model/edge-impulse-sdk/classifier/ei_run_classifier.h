@@ -38,6 +38,14 @@
 #include "ei_model_types.h"
 #include "model-parameters/model_metadata.h"
 
+// PATCH: max distinct impulse handles that can run through
+// process_impulse_continuous() concurrently in this build. You have 2
+// (wakeword + command) -- set generously in case you add a third later.
+#ifndef EI_MAX_CONTINUOUS_IMPULSE_HANDLES
+#define EI_MAX_CONTINUOUS_IMPULSE_HANDLES 4
+#endif
+
+
 #include "ei_run_dsp.h"
 #include "ei_classifier_types.h"
 #include "ei_signal_with_axes.h"
@@ -504,7 +512,44 @@ extern "C" EI_IMPULSE_ERROR process_impulse_continuous(ei_impulse_handle_t *hand
     memset(result->_raw_outputs, 0, sizeof(ei_feature_t) * handle->impulse->learning_blocks_size);
 
     auto impulse = handle->impulse;
-    static ei::matrix_t static_features_matrix(1, impulse->nn_input_frame_size);
+
+    // ── PATCH (multi-impulse continuous fix) ────────────────────────────────
+    // The stock SDK declares this as a function-local `static`, which is
+    // constructed exactly once for the entire process lifetime, using
+    // whichever impulse handle reaches this line first. Every subsequent
+    // call -- even with a different handle whose nn_input_frame_size differs
+    // -- silently reuses that first-call-sized buffer, causing out-of-bounds
+    // reads/writes once two merged impulses have different nn_input_frame_size.
+    // Fix: cache one matrix per handle pointer instead of one shared static.
+    struct ei_static_matrix_cache_entry_t {
+        const ei_impulse_handle_t *handle;
+        ei::matrix_t *matrix;
+    };
+    static ei_static_matrix_cache_entry_t s_matrix_cache[EI_MAX_CONTINUOUS_IMPULSE_HANDLES] = {};
+
+    ei::matrix_t *cached_matrix = nullptr;
+    for (size_t ix = 0; ix < EI_MAX_CONTINUOUS_IMPULSE_HANDLES; ix++) {
+        if (s_matrix_cache[ix].handle == handle) {
+            cached_matrix = s_matrix_cache[ix].matrix;
+            break;
+        }
+        if (s_matrix_cache[ix].handle == nullptr) {
+            s_matrix_cache[ix].matrix = new ei::matrix_t(1, impulse->nn_input_frame_size);
+            if (s_matrix_cache[ix].matrix == nullptr || !s_matrix_cache[ix].matrix->buffer) {
+                return EI_IMPULSE_ALLOC_FAILED;
+            }
+            s_matrix_cache[ix].handle = handle;
+            cached_matrix = s_matrix_cache[ix].matrix;
+            break;
+        }
+    }
+    if (cached_matrix == nullptr) {
+        ei_printf("ERR: EI_MAX_CONTINUOUS_IMPULSE_HANDLES exceeded, increase it in ei_run_classifier.h\n");
+        return EI_IMPULSE_ALLOC_FAILED;
+    }
+    ei::matrix_t &static_features_matrix = *cached_matrix;
+    // ── END PATCH ────────────────────────────────────────────────────────────
+
     if (!static_features_matrix.buffer) {
         return EI_IMPULSE_ALLOC_FAILED;
     }

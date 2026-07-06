@@ -2,9 +2,9 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/ringbuf.h"  // <--- ADDED: Safe async buffer passing
+#include "freertos/ringbuf.h"  
 #include "driver/uart.h"
-#include "driver/i2s_std.h"   // <--- ADDED: Modern ESP-IDF v5/v6 I2S driver
+#include "driver/i2s_std.h"   
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -20,86 +20,71 @@
 
 extern const ei_impulse_t impulse_1036490_1;
 extern const ei_impulse_t impulse_1037438_3;
+extern ei_impulse_handle_t impulse_handle_1036490_1;
 extern ei_impulse_handle_t impulse_handle_1037438_3;
 
 static const char *TAG = "INF_ENGINE";
 
 // ── Buffers ───────────────────────────────────────────────────────────────────
 static int16_t *g_ww_ring     = NULL;   // rolling window for wakeword inference
-static int16_t *g_cmd_capture = NULL;   // flat 2-second buffer for command inference
+static int16_t *g_cmd_ring    = NULL;   // rolling window for command inference
 static int16_t *g_uart_rx_buf = NULL;   // staging buffer for processing I2S data
 
 static i2s_chan_handle_t rx_chan   = NULL; // I2S Rx Handle
 static RingbufHandle_t s_audio_rb  = NULL; // FreeRTOS Ringbuffer
 
 #define CHUNK_SAMPLES      512
+#define AUDIO_SAMPLE_RATE  16000
+
+// Configuration variables
+#define GAP_DELAY_SAMPLES    (2 * AUDIO_SAMPLE_RATE)  // 2 seconds gap
+#define CMD_TIMEOUT_SAMPLES  (5 * AUDIO_SAMPLE_RATE)  // Updated to 5 seconds timeout fallback
 
 // Pin layout configuration matching the transmitter chip
 #define PIN_SLAVE_BCLK     GPIO_NUM_4   
 #define PIN_SLAVE_WS       GPIO_NUM_5   
 #define PIN_DATA_IN        GPIO_NUM_19  
-
-// Reads HIGH when Core ESP32 has an active SCO/HFP audio link.
-// Wire this to a free GPIO on the Core chip, driven in hfp_manager.c.
 #define PIN_BT_STATUS      GPIO_NUM_21
 
 // ── State machine 
 typedef enum {
     STATE_WAKEWORD,
-    STATE_CAPTURE,
-    // STATE_COMMAND,
+    STATE_DELAY_GAP,
+    STATE_COMMAND,
 } ie_state_t;
 
-static ie_state_t g_state         = STATE_WAKEWORD;
-static uint32_t   g_ww_write_pos  = 0;
+static ie_state_t g_state               = STATE_WAKEWORD;
+static uint32_t   g_ww_write_pos        = 0;
+static uint32_t   g_cmd_write_pos       = 0;
+static uint32_t   g_cmd_delay_counter   = 0;
+static uint32_t   g_cmd_timeout_counter = 0;
 
-// ── Rolling command-window classification state ─────────────────────────────
-// g_cmd_capture is a RING buffer sized to exactly one classification window
-// (CMD_MODEL_WINDOW_SAMPLES), not the full 5-second listen duration - storing
-// 5s flat (160KB) doesn't fit in internal DRAM with no PSRAM. Elapsed time for
-// the 5s timeout is tracked separately via g_cmd_total_written (a counter,
-// not a buffer size).
-static uint32_t   g_cmd_ring_pos       = 0;   // next write index into the ring, wraps at CMD_MODEL_WINDOW_SAMPLES
-static uint32_t   g_cmd_total_written  = 0;   // total samples seen since capture started (monotonic, for timeout)
-static uint32_t   g_cmd_last_check_pos = 0;   // throttles how often we classify
-static bool       g_vad_triggered      = false;  // true once real speech energy detected
-static char       g_pending_label[16]  = {0};    // last check's winning command, for consecutive-hit confirmation
-static int        g_pending_count      = 0;
-
-#define CMD_CHECK_INTERVAL_SAMPLES  4000       // check every ~0.25s of new audio
-#define VAD_ENERGY_THRESHOLD        250        // mean abs raw-sample amplitude that counts as "speech started"
-#define CMD_CONFIDENCE_MARGIN       0.15f      // best must beat 2nd-best by this much
-#define CMD_REQUIRED_CONSECUTIVE    2          // same label must win this many checks in a row
+// --- FALLBACK 3-SLICE TRACKING VARIABLES ---
+static uint32_t g_cmd_slice_count       = 0;
+static float    g_fallback_best_conf    = 0.0f;
+static int      g_fallback_best_cmd_byte= 0x00;
+static char     g_fallback_best_label[32] = "";
 
 // ── EI signal callbacks 
 static int ww_get_data(unsigned int offset, unsigned int length, float *out)
 {
     for (size_t i = 0; i < length; i++) {
         uint32_t idx = (g_ww_write_pos + offset + i) % WW_WINDOW_SAMPLES;
-        out[i] = (float)g_ww_ring[idx];   // raw int16 magnitude, matches int16_to_float() used by run_static_test()
+        out[i] = (float)g_ww_ring[idx];   
     }
     return 0;
 }
 
 static int cmd_get_data(unsigned int offset, unsigned int length, float *out)
 {
-    const float GAIN = 2.0f;  // tune 1.5-3.0 based on live confidence numbers
-
     for (size_t i = 0; i < length; i++) {
-        // g_cmd_ring_pos currently points at the OLDEST sample (next write slot,
-        // since the ring is exactly one window long once full) - reading forward
-        // from here with wraparound gives chronological oldest -> newest order.
-        uint32_t idx = (g_cmd_ring_pos + offset + i) % CMD_MODEL_WINDOW_SAMPLES;
-        float sample = (float)g_cmd_capture[idx];
-        sample *= GAIN;
-        if (sample >  32767.0f) sample =  32767.0f;
-        if (sample < -32768.0f) sample = -32768.0f;
-        out[i] = sample;
+        uint32_t idx = (g_cmd_write_pos + offset + i) % CMD_MODEL_WINDOW_SAMPLES;
+        out[i] = (float)g_cmd_ring[idx];   
     }
     return 0;
 }
 
-// ── Outbound UART configuration (Kept solely for sending commands back to Core)
+// ── Outbound UART configuration
 static void uart_init(void)
 {
     uart_config_t uart_config = {};
@@ -125,7 +110,6 @@ static void i2s_slave_init(void)
 {
     ESP_LOGI(TAG, "Initializing Standard Mode I2S Slave Receiver...");
 
-    // Allocate ring buffer: 16000 samples/sec * 2 bytes/sample * 1.5 seconds capacity
     s_audio_rb = xRingbufferCreate(16000 * 2 * 1.5, RINGBUF_TYPE_NOSPLIT);
     configASSERT(s_audio_rb);
 
@@ -133,10 +117,10 @@ static void i2s_slave_init(void)
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &rx_chan));
 
     i2s_std_config_t rx_std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(16000),
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,  // <--- Move mclk to the top
+            .mclk = I2S_GPIO_UNUSED,  
             .bclk = PIN_SLAVE_BCLK,
             .ws = PIN_SLAVE_WS,
             .dout = I2S_GPIO_UNUSED,
@@ -154,14 +138,12 @@ static void i2s_slave_init(void)
     ESP_LOGI(TAG, "I2S Slave Receiver Channel Enabled.");
 }
 
-// ── Background continuous DMA reader task running strictly on Core 0
 static void i2s_dma_ingest_task(void *arg)
 {
-    uint8_t dma_read_buf[640]; // Stores 320 samples
+    uint8_t dma_read_buf[640]; 
     size_t bytes_read = 0;
 
     while (1) {
-        // Automatically blocks on the physical hardware clock line until data frames exist
         if (i2s_channel_read(rx_chan, dma_read_buf, sizeof(dma_read_buf), &bytes_read, portMAX_DELAY) == ESP_OK) {
             if (bytes_read > 0) {
                 xRingbufferSend(s_audio_rb, dma_read_buf, bytes_read, pdMS_TO_TICKS(10));
@@ -170,7 +152,6 @@ static void i2s_dma_ingest_task(void *arg)
     }
 }
 
-// ── Main Inference processing worker task running strictly on Core 1
 static void inference_task(void *arg)
 {
     ESP_LOGI(TAG, "Inference task started on Core 1, state=WAKEWORD");
@@ -179,11 +160,13 @@ static void inference_task(void *arg)
     ww_signal.total_length = WW_WINDOW_SAMPLES;
     ww_signal.get_data     = &ww_get_data;
 
+    signal_t cmd_signal;
+    cmd_signal.total_length = CMD_MODEL_WINDOW_SAMPLES;   
+    cmd_signal.get_data     = &cmd_get_data;
+
     size_t rb_bytes_received = 0;
 
     while (1) {
-        // === UNFREEZE IMPLEMENTATION ZONE ===
-        // Pull available blocks from our synchronized hardware ring buffer
         int16_t *raw_rb_samples = (int16_t *)xRingbufferReceive(s_audio_rb, &rb_bytes_received, portMAX_DELAY);
 
         if (raw_rb_samples == NULL || rb_bytes_received == 0) {
@@ -192,18 +175,14 @@ static void inference_task(void *arg)
 
         int samples_read = rb_bytes_received / sizeof(int16_t);
 
-        // Only feed the classifiers real audio once the Core chip reports
-        // an active SCO/HFP link. Otherwise drain the ring buffer (so it
-        // doesn't back up / block the DMA task) but discard the data and
-        // keep the state machine parked in WAKEWORD.
         if (gpio_get_level(PIN_BT_STATUS) == 0) {
             vRingbufferReturnItem(s_audio_rb, (void *)raw_rb_samples);
             g_state = STATE_WAKEWORD;
             g_ww_write_pos = 0;
+            g_cmd_write_pos = 0;
             continue;
         }
 
-        // Safely stage data into our tracking frame arrays
         for (int chunk_idx = 0; chunk_idx < samples_read; chunk_idx += CHUNK_SAMPLES) {
             int rem = samples_read - chunk_idx;
             int current_chunk_size = (rem < CHUNK_SAMPLES) ? rem : CHUNK_SAMPLES;
@@ -217,180 +196,172 @@ static void inference_task(void *arg)
                     g_ww_ring[g_ww_write_pos % WW_WINDOW_SAMPLES] = g_uart_rx_buf[i];
                     g_ww_write_pos++;
 
-                    // Fire exactly once per full slice (checked per-sample since
-                    // CHUNK_SAMPLES=512 does not evenly divide WW_SLICE_SAMPLES=4000;
-                    // a post-chunk check can step over the boundary and never fire).
-                    if (g_ww_write_pos >= WW_WINDOW_SAMPLES &&
-                        (g_ww_write_pos % WW_SLICE_SAMPLES) == 0) {
-
-                        // === RAW FEATURE DIAGNOSTIC ===
-                        // Dump the first 20 raw samples of the current window so you
-                        // can compare magnitude/shape against the ww_features[] array
-                        // that works in run_static_test(). Silence should look like
-                        // small numbers (-10..10); real speech should show swings
-                        // into the hundreds/thousands, same as the static array.
-                        {
-                            char dbg[220];
-                            int dbg_off = 0;
-                            for (int d = 0; d < 20; d++) {
-                                uint32_t didx = (g_ww_write_pos + d) % WW_WINDOW_SAMPLES;
-                                dbg_off += snprintf(dbg + dbg_off, sizeof(dbg) - dbg_off, "%d ", g_ww_ring[didx]);
-                            }
-                            ESP_LOGI(TAG, "WW raw[0:20] = %s", dbg);
-                        }
-
+                    if (g_ww_write_pos >= WW_WINDOW_SAMPLES && (g_ww_write_pos % WW_SLICE_SAMPLES) == 0) {
                         ei_impulse_result_t ww_result = {};
-                        const ei_impulse_t *ww_snapshot_ptr = &impulse_1036490_1;
-                        EI_IMPULSE_ERROR err = run_classifier_continuous(&ww_signal, &ww_result, ww_snapshot_ptr, false);
+                        
+                        EI_IMPULSE_ERROR err = run_classifier_continuous(&impulse_handle_1036490_1, &ww_signal, &ww_result, false);
                         if (err != EI_IMPULSE_OK) {
                             ESP_LOGE(TAG, "WW classifier error: %d", err);
                             continue;
-                        }
-
-                        for (uint32_t k = 0; k < impulse_1036490_1.label_count; k++) {
-                            ESP_LOGI(TAG, "WW [%s] = %.3f", impulse_1036490_1.categories[k], ww_result.classification[k].value);
                         }
 
                         for (uint32_t l = 0; l < impulse_1036490_1.label_count; l++) {
                             if (strcmp(ww_result.classification[l].label, "hey_mio") == 0) {
                                 float conf = ww_result.classification[l].value;
                                 if (conf > WW_CONFIDENCE_THRESHOLD) {
-                                    ESP_LOGI(TAG, "Wakeword detected (%.3f) → CAPTURE", conf);
-                                    g_cmd_ring_pos       = 0;
-                                    g_cmd_total_written  = 0;
-                                    g_cmd_last_check_pos = 0;
-                                    g_vad_triggered      = false;
-                                    g_pending_label[0]   = '\0';
-                                    g_pending_count      = 0;
-                                    memset(g_cmd_capture, 0, CMD_MODEL_WINDOW_SAMPLES * sizeof(int16_t));
-                                    g_state = STATE_CAPTURE;
+                                    ESP_LOGI(TAG, "Wakeword detected (%.3f) → Entering 2s Gap Delay State", conf);
+                                    g_cmd_delay_counter = 0;
+                                    g_state = STATE_DELAY_GAP;
                                 }
                                 break;
                             }
                         }
-                        if (g_state == STATE_CAPTURE) break;
+                        if (g_state == STATE_DELAY_GAP) break;
                     }
                 }
                 break;
             }
 
-            case STATE_CAPTURE: {
-                // Write into the ring buffer sample-by-sample (wraps at
-                // CMD_MODEL_WINDOW_SAMPLES); g_cmd_total_written tracks total
-                // elapsed samples since capture began, independent of ring size,
-                // used for the 5s timeout and the ~0.25s check throttle.
-                uint32_t chunk_energy_sum = 0;
+            case STATE_DELAY_GAP: {
                 for (int i = 0; i < current_chunk_size; i++) {
-                    int16_t s = g_uart_rx_buf[i];
-                    chunk_energy_sum += (s < 0) ? (uint32_t)(-s) : (uint32_t)s;
+                    g_cmd_delay_counter++;
 
-                    g_cmd_capture[g_cmd_ring_pos] = s;
-                    g_cmd_ring_pos = (g_cmd_ring_pos + 1) % CMD_MODEL_WINDOW_SAMPLES;
-                    g_cmd_total_written++;
-                }
+                    if (g_cmd_delay_counter >= GAP_DELAY_SAMPLES) {
+                        ESP_LOGI(TAG, "2 Second Gap Complete → Transitioning to Continuous COMMAND Mode");
+                        
+                        memset(g_cmd_ring, 0, CMD_MODEL_WINDOW_SAMPLES * sizeof(int16_t));
+                        g_cmd_write_pos = 0;
+                        g_cmd_timeout_counter = 0;
+                        
+                        // Clear the 3-slice voting trackers before entry
+                        g_cmd_slice_count = 0;
+                        g_fallback_best_conf = 0.0f;
+                        g_fallback_best_cmd_byte = 0x00;
+                        strcpy(g_fallback_best_label, "");
 
-                // VAD: only start checking once real speech energy appears, instead
-                // of guessing a fixed delay - much more robust to how long the user
-                // actually pauses after the wake word.
-                if (!g_vad_triggered && current_chunk_size > 0) {
-                    uint32_t avg_energy = chunk_energy_sum / (uint32_t)current_chunk_size;
-                    if (avg_energy > VAD_ENERGY_THRESHOLD) {
-                        g_vad_triggered = true;
-                        ESP_LOGI(TAG, "VAD: speech onset detected (energy=%u)", (unsigned)avg_energy);
+                        run_classifier_init(&impulse_handle_1037438_3);
+                        g_state = STATE_COMMAND;
+                        break;
                     }
                 }
+                break;
+            }
 
-                bool have_full_window = (g_cmd_total_written >= CMD_MODEL_WINDOW_SAMPLES);
-                bool due_for_check    = (g_cmd_total_written - g_cmd_last_check_pos) >= CMD_CHECK_INTERVAL_SAMPLES;
-                bool window_time_out  = (g_cmd_total_written >= CMD_CAPTURE_SAMPLES);
+            case STATE_COMMAND: {
+                for (int i = 0; i < current_chunk_size; i++) {
+                    g_cmd_ring[g_cmd_write_pos % CMD_MODEL_WINDOW_SAMPLES] = g_uart_rx_buf[i];
+                    g_cmd_write_pos++;
+                    g_cmd_timeout_counter++;
 
-                if (have_full_window && g_vad_triggered && (due_for_check || window_time_out)) {
-                    g_cmd_last_check_pos = g_cmd_total_written;
+                    // Safe Fallback: Reset back to tracking wake-words if time expires
+                    if (g_cmd_timeout_counter >= CMD_TIMEOUT_SAMPLES) {
+                        ESP_LOGW(TAG, "Command parsing timed out (5s). Returning to WAKEWORD mode.");
+                        memset(g_ww_ring, 0, WW_WINDOW_SAMPLES * sizeof(int16_t));
+                        g_ww_write_pos = 0;
+                        g_state = STATE_WAKEWORD;
+                        break;
+                    }
 
-                    ei_impulse_result_t cmd_result = {};
-                    signal_t cmd_signal_local;
-                    cmd_signal_local.total_length = CMD_MODEL_WINDOW_SAMPLES;
-                    cmd_signal_local.get_data     = &cmd_get_data;
+                    if (g_cmd_write_pos >= CMD_MODEL_WINDOW_SAMPLES && (g_cmd_write_pos % CMD_SLICE_SAMPLES) == 0) {
+                        
+                        ei_impulse_result_t cmd_result = {};
+                        EI_IMPULSE_ERROR err = run_classifier_continuous(&impulse_handle_1037438_3, &cmd_signal, &cmd_result, false);
 
-                    EI_IMPULSE_ERROR err = run_classifier(&impulse_handle_1037438_3, &cmd_signal_local, &cmd_result, false);
+                        if (err != EI_IMPULSE_OK) {
+                            ESP_LOGE(TAG, "CMD classifier error: %d", err);
+                            g_state = STATE_WAKEWORD;
+                            memset(g_ww_ring, 0, WW_WINDOW_SAMPLES * sizeof(int16_t));
+                            g_ww_write_pos = 0;
+                            break;
+                        }
 
-                    if (err == EI_IMPULSE_OK) {
-                        float best_conf   = 0.0f;
-                        float second_conf = 0.0f;
-                        int   best_idx    = -1;
+                        g_cmd_slice_count++; // Track how many windows have rolled by
 
-                        for (uint32_t i = 0; i < impulse_1037438_3.label_count; i++) {
-                            float v = cmd_result.classification[i].value;
-                            ESP_LOGI(TAG, "CMD [%s] = %.3f", impulse_1037438_3.categories[i], v);
-                            if (v > best_conf) {
-                                second_conf = best_conf;
-                                best_conf   = v;
-                                best_idx    = i;
-                            } else if (v > second_conf) {
-                                second_conf = v;
+                        // Debug logging setup
+                        {
+                            char conf_buf[160];
+                            int off = 0;
+                            for (uint32_t c = 0; c < impulse_1037438_3.label_count && off < (int)sizeof(conf_buf) - 24; c++) {
+                                off += snprintf(conf_buf + off, sizeof(conf_buf) - off, "%s:%.3f ",
+                                                 cmd_result.classification[c].label,
+                                                 cmd_result.classification[c].value);
+                            }
+                            ESP_LOGI(TAG, "CMD Slice #%" PRIu32 " conf [%s]", g_cmd_slice_count, conf_buf);
+                        }
+
+                        float best_slice_conf = 0.0f;
+                        int best_slice_idx = -1;
+                        
+                        // Parse highest confidence target in this individual slice
+                        for (uint32_t c = 0; c < impulse_1037438_3.label_count; c++) {
+                            if (cmd_result.classification[c].value > best_slice_conf) {
+                                best_slice_conf = cmd_result.classification[c].value;
+                                best_slice_idx = c;
                             }
                         }
 
-                        bool margin_ok = (best_conf - second_conf) >= CMD_CONFIDENCE_MARGIN;
+                        if (best_slice_idx >= 0) {
+                            const char *label = cmd_result.classification[best_slice_idx].label;
 
-                        if (best_idx >= 0 && best_conf > CMD_CONFIDENCE_THRESHOLD && margin_ok) {
-                            const char *label = cmd_result.classification[best_idx].label;
+                            // PATH A: Immediate Critical Threshold Hit
+                            if (best_slice_conf > CMD_CONFIDENCE_THRESHOLD && 
+                                strcmp(label, "noise") != 0 && strcmp(label, "unknown") != 0) {
+                                
+                                ESP_LOGI(TAG, "CRITICAL HIT: %s crossed threshold (%.3f)", label, best_slice_conf);
+                                uint8_t cmd_byte = 0x00;
+                                if      (strcmp(label, "kansei") == 0) cmd_byte = 0x01;
+                                else if (strcmp(label, "kiroku") == 0) cmd_byte = 0x02;
+                                else if (strcmp(label, "ibasho") == 0) cmd_byte = 0x03;
 
-                            uint8_t cmd_byte = 0x00;
-                            if      (strcmp(label, "kansei") == 0) cmd_byte = 0x01;
-                            else if (strcmp(label, "kiroku") == 0) cmd_byte = 0x02;
-                            else if (strcmp(label, "ibasho") == 0) cmd_byte = 0x03;
-
-                            if (cmd_byte != 0x00) {
-                                // Track consecutive agreeing checks before acting - filters
-                                // out one-off misfires from a single noisy window.
-                                if (strcmp(g_pending_label, label) == 0) {
-                                    g_pending_count++;
-                                } else {
-                                    strncpy(g_pending_label, label, sizeof(g_pending_label) - 1);
-                                    g_pending_label[sizeof(g_pending_label) - 1] = '\0';
-                                    g_pending_count = 1;
-                                }
-
-                                ESP_LOGI(TAG, "Tentative: %s (%.3f) x%d", label, best_conf, g_pending_count);
-
-                                if (g_pending_count >= CMD_REQUIRED_CONSECUTIVE) {
-                                    ESP_LOGI(TAG, "COMMAND DETECTED: %s (%.3f)", label, best_conf);
+                                if (cmd_byte != 0x00) {
                                     uint8_t pkt[3] = { 0xAA, cmd_byte, static_cast<uint8_t>(0xAA ^ cmd_byte) };
                                     uart_write_bytes(IE_UART_NUM, (const char *)pkt, sizeof(pkt));
                                     ESP_LOGI(TAG, "Sent packet to core [AA %02X %02X]", cmd_byte, pkt[2]);
-
+                                    
+                                    memset(g_ww_ring, 0, WW_WINDOW_SAMPLES * sizeof(int16_t));
+                                    g_ww_write_pos = 0;
                                     g_state = STATE_WAKEWORD;
                                     break;
                                 }
-                            } else {
-                                // "unknown" crossed threshold - not a real command, reset any
-                                // pending streak and keep listening within the 5s window.
-                                ESP_LOGI(TAG, "High-confidence unknown (%.3f) - still listening", best_conf);
-                                g_pending_label[0] = '\0';
-                                g_pending_count    = 0;
                             }
-                        } else {
-                            // Low confidence or ambiguous (no clear margin) - don't let a
-                            // weak/uncertain check count toward the pending streak.
-                            g_pending_label[0] = '\0';
-                            g_pending_count    = 0;
-                        }
-                    } else {
-                        ESP_LOGE(TAG, "CMD classifier error: %d", err);
-                    }
-                }
 
-                if (window_time_out && g_state != STATE_WAKEWORD) {
-                    ESP_LOGI(TAG, "5s command window expired, no match → WAKEWORD");
-                    g_state = STATE_WAKEWORD;
+                            // PATH B: Track Highest Score across slices if below thresholds (skipping unknown/noise)
+                            if (strcmp(label, "noise") != 0 && strcmp(label, "unknown") != 0) {
+                                if (best_slice_conf > g_fallback_best_conf) {
+                                    g_fallback_best_conf = best_slice_conf;
+                                    strncpy(g_fallback_best_label, label, sizeof(g_fallback_best_label) - 1);
+                                    
+                                    if      (strcmp(label, "kansei") == 0) g_fallback_best_cmd_byte = 0x01;
+                                    else if (strcmp(label, "kiroku") == 0) g_fallback_best_cmd_byte = 0x02;
+                                    else if (strcmp(label, "ibasho") == 0) g_fallback_best_cmd_byte = 0x03;
+                                }
+                            }
+                        }
+
+                        // PATH C: 3 Slices Complete without any threshold breakthroughs -> Trigger Best of 3
+                        if (g_cmd_slice_count >= 3) {
+                            if (g_fallback_best_cmd_byte != 0x00) {
+                                ESP_LOGI(TAG, "FALLBACK DECISION: No absolute hit. Best of 3 chosen: %s (%.3f)", 
+                                         g_fallback_best_label, g_fallback_best_conf);
+
+                                uint8_t pkt[3] = { 0xAA, (uint8_t)g_fallback_best_cmd_byte, static_cast<uint8_t>(0xAA ^ g_fallback_best_cmd_byte) };
+                                uart_write_bytes(IE_UART_NUM, (const char *)pkt, sizeof(pkt));
+                            } else {
+                                ESP_LOGW(TAG, "FALLBACK EVALUATION: All 3 loops dominated by noise/unknown. Discarding block.");
+                            }
+
+                            // Clean tracking variables and step back to tracking wake-words
+                            memset(g_ww_ring, 0, WW_WINDOW_SAMPLES * sizeof(int16_t));
+                            g_ww_write_pos = 0;
+                            g_state = STATE_WAKEWORD;
+                            break;
+                        }
+                    }
                 }
                 break;
             }
             }
         }
-
-        // Return allocation token window frame back to system memory
         vRingbufferReturnItem(s_audio_rb, (void *)raw_rb_samples);
     } 
 }
@@ -410,10 +381,7 @@ void inference_engine_init(void)
         WW_WINDOW_SAMPLES * sizeof(int16_t),
         MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
 
-    // g_cmd_capture is a ring buffer sized to exactly one classification
-    // window (32KB), not the full 5s listen duration (which would be 160KB -
-    // too large for a single contiguous internal-DRAM allocation with no PSRAM).
-    g_cmd_capture = (int16_t *)heap_caps_malloc(
+    g_cmd_ring = (int16_t *)heap_caps_malloc(
         CMD_MODEL_WINDOW_SAMPLES * sizeof(int16_t),
         MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
 
@@ -422,36 +390,17 @@ void inference_engine_init(void)
         MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
 
     configASSERT(g_ww_ring);
-    configASSERT(g_cmd_capture);
+    configASSERT(g_cmd_ring);
     configASSERT(g_uart_rx_buf);
 
-    memset(g_ww_ring,     0, WW_WINDOW_SAMPLES        * sizeof(int16_t));
-    memset(g_cmd_capture, 0, CMD_MODEL_WINDOW_SAMPLES  * sizeof(int16_t));
+    memset(g_ww_ring,  0, WW_WINDOW_SAMPLES        * sizeof(int16_t));
+    memset(g_cmd_ring, 0, CMD_MODEL_WINDOW_SAMPLES * sizeof(int16_t));
 
-    uart_init();       // Outbound signaling UART initialization
-    i2s_slave_init();  // Inbound streaming I2S Audio receiver initialization
+    uart_init();       
+    i2s_slave_init();  
 
-    // Spawn high-frequency hardware ingestion onto Core 0
-    xTaskCreatePinnedToCore(
-        i2s_dma_ingest_task,
-        "i2s_dma_ingest",
-        4096,
-        NULL,
-        10,
-        NULL,
-        0
-    );
+    xTaskCreatePinnedToCore(i2s_dma_ingest_task, "i2s_dma_ingest", 4096, NULL, 10, NULL, 0);
+    xTaskCreatePinnedToCore(inference_task, "inference", 16384, NULL, 5, NULL, 1);
 
-    // Spawn heavy mathematical ML compilation framework loops onto Core 1
-    xTaskCreatePinnedToCore(
-        inference_task,
-        "inference",
-        16384, 
-        NULL,
-        5,
-        NULL,
-        1
-    );
-
-    ESP_LOGI(TAG, "Inference engine configuration fully updated to I2S.");
+    ESP_LOGI(TAG, "Inference engine configuration completely validated and initialized.");
 }

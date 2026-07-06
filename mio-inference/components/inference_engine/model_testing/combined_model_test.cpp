@@ -42,14 +42,14 @@ static void run_static_test(void)
         sizeof(cmd_features) / sizeof(float), &cmd_sig);
 
     ei_impulse_result_t cmd_result = {};
-    const ei_impulse_t *cmd_ptr = &impulse_1037438_3;
+    const ei_impulse_t *cmd_ptr = &impulse_1037438_1;
     EI_IMPULSE_ERROR e2 = run_classifier_continuous(&cmd_sig, &cmd_result, cmd_ptr, false);
 
     ESP_LOGI(TAG, "CMD classifier err=%d", e2);
-    for (uint32_t i = 0; i < impulse_1037438_3.label_count; i++) {
+    for (uint32_t i = 0; i < impulse_1037438_1.label_count; i++) {
     ESP_LOGI(TAG,
              "CMD [%s] = %.3f",
-             impulse_1037438_3.categories[i],
+             impulse_1037438_1.categories[i],
              cmd_result.classification[i].value);
 }
 

@@ -22,8 +22,9 @@ extern "C" {
 #define WW_SLICE_SAMPLES    4000   // must match model_variables.h slice_size (16000/4)
 
 // Command capture: 2 seconds of audio
-#define CMD_CAPTURE_SAMPLES (IE_SAMPLE_RATE_HZ * 5)
-#define CMD_MODEL_WINDOW_SAMPLES  16000  // must match impulse_1037438_3.dsp_input_frame_size
+// #define CMD_CAPTURE_SAMPLES (IE_SAMPLE_RATE_HZ * 2)
+#define CMD_MODEL_WINDOW_SAMPLES  24000  // must match impulse_1037438_3.dsp_input_frame_size
+#define CMD_SLICE_SAMPLES      6000
 
 // ── Inference thresholds ──────────────────────────────────────────────────────
 #define WW_CONFIDENCE_THRESHOLD  0.85f
@@ -35,7 +36,6 @@ extern "C" {
 // for both ei_impulse_t declarations, then update these two lines.
 #define WW_IMPULSE_HANDLE    impulse_1036490_1
 #define CMD_IMPULSE_HANDLE   impulse_1037438_3
-
 
 // ── Public API ────────────────────────────────────────────────────────────────
 void inference_engine_init(void);

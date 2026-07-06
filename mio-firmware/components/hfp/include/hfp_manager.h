@@ -4,3 +4,4 @@
 
 void hfp_init(void);
 void hfp_connect(esp_bd_addr_t remote_bda);
+// void hfp_manager_start_capture_countdown(void);
