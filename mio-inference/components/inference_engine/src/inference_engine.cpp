@@ -72,10 +72,11 @@ static uint32_t   g_countdown_counter   = 0;
 // audio takes 1.5x as long = ~0.667x speed. Carries one sample of lookback
 // + a fractional position across calls so there's no click/discontinuity
 // at chunk boundaries.
+
+
 #define WW_STRETCH_RATIO        1.5f
 #define WW_STRETCH_STEP         (1.0f / WW_STRETCH_RATIO)   // ~0.6667 input-samples per output-sample
-#define WW_STRETCH_SCRATCH_LEN  800                          // int16 samples of headroom per CHUNK_SAMPLES call
-
+#define WW_STRETCH_SCRATCH_LEN  800                        
 static float   s_ww_stretch_pos     = 0.0f;
 static int16_t s_ww_stretch_prev    = 0;
 static bool    s_ww_stretch_primed  = false;
@@ -155,6 +156,36 @@ static void cmd_stretch_capture_to_output(const int16_t *raw_input, int16_t *str
     }
 }
 
+// ── Inference → Core state signaling ────────────────────────────────────────
+// Rides the same physical UART already wired to the core ESP32 (the one used
+// below to dispatch recognized commands). Command packets are UNCHANGED —
+// still [0xAA, cmd_byte, checksum] — so anything already parsing those is
+// unaffected. State/event packets use a distinct header byte (0xBB) so the
+// core can tell "update the OLED state" apart from "a command was recognized"
+// with zero ambiguity, using the same simple XOR-checksum framing.
+//
+// The core side needs a small UART RX handler that reads 3-byte frames and
+// switches on pkt[0] (0xAA vs 0xBB) — not implemented here since this file
+// only owns the inference side of the link.
+#define IE_EVT_HEADER   0xBB
+
+typedef enum {
+    IE_EVT_LISTENING_WAKEWORD   = 0x01, // idle, listening for "hey mio"
+    IE_EVT_WAKEWORD_DETECTED    = 0x02,
+    IE_EVT_COUNTDOWN_3          = 0x03,
+    IE_EVT_COUNTDOWN_2          = 0x04,
+    IE_EVT_COUNTDOWN_1          = 0x05,
+    IE_EVT_LISTENING_COMMAND    = 0x06, // capturing the 1.0s command clip
+    IE_EVT_COMMAND_UNRECOGNIZED = 0x07, // capture done, no confident label
+    IE_EVT_COMMAND_TIMEOUT      = 0x08, // capture mostly silent / classifier error
+} ie_event_t;
+
+static void ie_send_event(ie_event_t evt)
+{
+    uint8_t pkt[3] = { IE_EVT_HEADER, (uint8_t)evt, (uint8_t)(IE_EVT_HEADER ^ (uint8_t)evt) };
+    uart_write_bytes(IE_UART_NUM, (const char *)pkt, sizeof(pkt));
+}
+
 // ── EI signal callbacks 
 static int ww_get_data(unsigned int offset, unsigned int length, float *out)
 {
@@ -174,7 +205,7 @@ static int cmd_get_data(unsigned int offset, unsigned int length, float *out)
     return 0;
 }
 
-// ── Audio clarity repair — CMD buffer only, never applied to g_ww_ring ──────────
+// ── Audio clarity repair ──────────
 // mSBC/SCO packet loss shows up as short flat runs (silence or repeated-frame PLC)
 // in the PCM stream — this is what reads as "robotic"/glitchy on playback.
 // 1) Detect runs of identical samples longer than GLITCH_RUN_THRESHOLD and
@@ -254,6 +285,7 @@ static void i2s_dma_ingest_task(void *arg)
 static void inference_task(void *arg)
 {
     ESP_LOGI(TAG, "Inference task started on Core 1, state=WAKEWORD");
+    ie_send_event(IE_EVT_LISTENING_WAKEWORD);
 
     signal_t ww_signal;
     ww_signal.total_length = WW_WINDOW_SAMPLES;
@@ -277,6 +309,11 @@ static void inference_task(void *arg)
 
         if (gpio_get_level(PIN_BT_STATUS) == 0) {
             vRingbufferReturnItem(s_audio_rb, (void *)raw_rb_samples);
+            if (g_state != STATE_WAKEWORD) {
+                // Only signal on the actual transition back to idle, so we
+                // don't flood the UART link every loop while SCO stays down.
+                ie_send_event(IE_EVT_LISTENING_WAKEWORD);
+            }
             g_state = STATE_WAKEWORD;
             g_ww_write_pos = 0;
             g_cmd_write_pos = 0;
@@ -325,6 +362,7 @@ static void inference_task(void *arg)
                                     ESP_LOGI(TAG, "Wakeword detected (%.3f) → Entering Gap Delay State", conf);
                                     g_cmd_delay_counter = 0;
                                     g_state = STATE_DELAY_GAP;
+                                    ie_send_event(IE_EVT_WAKEWORD_DETECTED);
                                 }
                                 break;
                             }
@@ -358,6 +396,9 @@ static void inference_task(void *arg)
                     if (current_second != last_countdown_second && current_second >= 1) {
                         ESP_LOGI(TAG, "SPEAK COMMAND IN... %" PRIu32, current_second);
                         last_countdown_second = current_second;
+                        if (current_second == 3)      ie_send_event(IE_EVT_COUNTDOWN_3);
+                        else if (current_second == 2) ie_send_event(IE_EVT_COUNTDOWN_2);
+                        else if (current_second == 1) ie_send_event(IE_EVT_COUNTDOWN_1);
                     }
 
                     if (g_countdown_counter >= (3 * AUDIO_SAMPLE_RATE)) {
@@ -367,6 +408,7 @@ static void inference_task(void *arg)
                         memset(g_cmd_raw_capture, 0, CMD_RAW_CAPTURE_SAMPLES * sizeof(int16_t));
                         g_cmd_write_pos = 0;
                         g_state = STATE_COMMAND_CAPTURE;
+                        ie_send_event(IE_EVT_LISTENING_COMMAND);
                         break;
                     }
                 }
@@ -397,9 +439,11 @@ static void inference_task(void *arg)
                         float zero_ratio = (float)zero_count / CMD_RAW_CAPTURE_SAMPLES;
                         if (zero_ratio >= 0.75f) {
                             ESP_LOGW(TAG, "Captured buffer dropped: %.1f%% zeros detected. Returning to WAKEWORD.", zero_ratio * 100.0f);
+                            ie_send_event(IE_EVT_COMMAND_TIMEOUT);
                             memset(g_ww_ring, 0, WW_WINDOW_SAMPLES * sizeof(int16_t));
                             g_ww_write_pos = 0;
                             g_state = STATE_WAKEWORD;
+                            ie_send_event(IE_EVT_LISTENING_WAKEWORD);
                             break;
                         }
 
@@ -416,9 +460,11 @@ static void inference_task(void *arg)
 
                         if (err != EI_IMPULSE_OK) {
                             ESP_LOGE(TAG, "CMD Single Classifier execution failed: %d", err);
+                            ie_send_event(IE_EVT_COMMAND_TIMEOUT);
                             memset(g_ww_ring, 0, WW_WINDOW_SAMPLES * sizeof(int16_t));
                             g_ww_write_pos = 0;
                             g_state = STATE_WAKEWORD;
+                            ie_send_event(IE_EVT_LISTENING_WAKEWORD);
                             break;
                         }
 
@@ -456,12 +502,14 @@ static void inference_task(void *arg)
                             ESP_LOGI(TAG, "Sent UART Packet [AA %02X %02X]", best_cmd_byte, pkt[2]);
                         } else {
                             ESP_LOGW(TAG, "EVALUATION FAILURE: Frame was dominated entirely by background noise elements.");
+                            ie_send_event(IE_EVT_COMMAND_UNRECOGNIZED);
                         }
 
                         // Return cleanly to early processing loop
                         memset(g_ww_ring, 0, WW_WINDOW_SAMPLES * sizeof(int16_t));
                         g_ww_write_pos = 0;
                         g_state = STATE_WAKEWORD;
+                        ie_send_event(IE_EVT_LISTENING_WAKEWORD);
                         break;
                     }
                 }

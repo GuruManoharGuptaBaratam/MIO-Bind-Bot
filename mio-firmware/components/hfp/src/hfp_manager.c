@@ -9,7 +9,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/ringbuf.h"
-#include "i2s_tx.h" // <--- ADD THIS INCLUDE
+#include "i2s_tx.h" 
 #include "driver/gpio.h"
 
 // Drives HIGH while SCO/HFP audio is actually connected.
@@ -103,10 +103,10 @@ static void incoming_data_callback(const uint8_t *buf, uint32_t len)
     s_loopback_len = loop_len;
 
     // Debug: first 10 bytes, to visually confirm bytes change with voice
-    if (len >= 10) {
-        ESP_LOGI(TAG, "★ AUDIO ★ %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9]);
-    }
+    // if (len >= 10) {
+    //     ESP_LOGI(TAG, "★ AUDIO ★ %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+    //         buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9]);
+    // }
 
     // Non-blocking push of the DIRECT, unmodified audio into the smoothing
     // ring buffer. If it's full (feeder task falling behind), drop this
@@ -139,7 +139,6 @@ static uint32_t outgoing_data_callback(uint8_t *buf, uint32_t len)
         
         for (uint32_t i = 0; i < num_samples; i++) {
             int32_t amplified = (int32_t)samples[i] * 3; // increase 3 for more volume
-            // Clamp to prevent overflow
             if (amplified > 32767) amplified = 32767;
             if (amplified < -32768) amplified = -32768;
             out[i] = (int16_t)amplified;

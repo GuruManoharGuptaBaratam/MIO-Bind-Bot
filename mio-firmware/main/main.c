@@ -8,6 +8,7 @@
 #include "hfp_manager.h"
 #include <string.h>
 #include "hfp_manager.h"
+#include "core_uart_receiver.h"
 
 static const char *TAG = "MIO_BT";
 
@@ -167,6 +168,12 @@ void app_main(void)
     );
 
     ESP_LOGI(TAG, "Started Bluetooth Scan");
+
+    // Independent peripheral from BT/HFP — order relative to hfp_init()
+    // doesn't matter. Register callbacks here later (e.g. to drive the
+    // OLED) via core_uart_receiver_set_callbacks(); logging works out of
+    // the box even with no callbacks registered.
+    core_uart_receiver_init();
 
     hfp_init();
 }
