@@ -9,8 +9,9 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/ringbuf.h"
-#include "i2s_tx.h" 
+#include "i2s_tx.h" // <--- ADD THIS INCLUDE
 #include "driver/gpio.h"
+#include "tft_display.h"
 
 // Drives HIGH while SCO/HFP audio is actually connected.
 // Wire this to PIN_BT_STATUS on the Inference ESP32 (GPIO21 there).
@@ -139,6 +140,7 @@ static uint32_t outgoing_data_callback(uint8_t *buf, uint32_t len)
         
         for (uint32_t i = 0; i < num_samples; i++) {
             int32_t amplified = (int32_t)samples[i] * 3; // increase 3 for more volume
+            // Clamp to prevent overflow
             if (amplified > 32767) amplified = 32767;
             if (amplified < -32768) amplified = -32768;
             out[i] = (int16_t)amplified;
@@ -197,6 +199,7 @@ static void hfp_callback(
                     esp_bt_sleep_disable();
                     gpio_set_level(PIN_BT_STATUS_OUT, 1);
                     s_sco_connected = true;
+                    tft_display_on_bt_state(true);
                     break;
 
                 case ESP_HF_AUDIO_STATE_CONNECTED_MSBC:
@@ -205,6 +208,7 @@ static void hfp_callback(
                     esp_bt_sleep_disable();
                     gpio_set_level(PIN_BT_STATUS_OUT, 1);
                     s_sco_connected = true;
+                    tft_display_on_bt_state(true);
                     break;
 
                 case ESP_HF_AUDIO_STATE_DISCONNECTED:
@@ -212,6 +216,7 @@ static void hfp_callback(
                     gpio_set_level(PIN_BT_STATUS_OUT, 0);
                     s_sco_connected = false;
                     g_audio_started = false;
+                    tft_display_on_bt_state(false);
                     vTaskDelay(pdMS_TO_TICKS(500));
                     if (memcmp(g_remote_bda, (esp_bd_addr_t){0}, ESP_BD_ADDR_LEN) != 0) {
                         g_audio_started = true;

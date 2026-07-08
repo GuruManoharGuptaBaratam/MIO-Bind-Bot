@@ -9,6 +9,7 @@
 #include <string.h>
 #include "hfp_manager.h"
 #include "core_uart_receiver.h"
+#include "tft_display.h"
 
 static const char *TAG = "MIO_BT";
 
@@ -169,10 +170,13 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Started Bluetooth Scan");
 
+    // Display must be up before any inference-link packets can be shown.
+    tft_display_init();
+
     // Independent peripheral from BT/HFP — order relative to hfp_init()
-    // doesn't matter. Register callbacks here later (e.g. to drive the
-    // OLED) via core_uart_receiver_set_callbacks(); logging works out of
-    // the box even with no callbacks registered.
+    // doesn't matter. Routes every inference-engine command/event straight
+    // to the display.
+    core_uart_receiver_set_callbacks(tft_display_on_ie_command, tft_display_on_ie_event);
     core_uart_receiver_init();
 
     hfp_init();
