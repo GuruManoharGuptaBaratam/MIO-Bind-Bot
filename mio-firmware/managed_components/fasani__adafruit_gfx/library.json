@@ -1,8 +1,0 @@
-{
-    "name": "adafruit-gfx-library-esp-idf",
-    "version": "1.7.7",
-    "build": {
-      "includeDir": ".",
-      "srcDir": "."
-    }
-}

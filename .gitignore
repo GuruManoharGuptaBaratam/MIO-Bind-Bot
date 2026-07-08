@@ -11,6 +11,8 @@
 **/.venv/
 **/venv/
 
+mio-firmware/managed_components/
+
 
 .DS_Store
 /working-backup( when any issue )
