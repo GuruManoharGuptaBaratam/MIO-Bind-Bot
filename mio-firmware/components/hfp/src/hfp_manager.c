@@ -181,6 +181,11 @@ static void hfp_callback(
             }
             else if(param->conn_stat.state == ESP_HF_CONNECTION_STATE_DISCONNECTED)
             {
+                ESP_LOGW(TAG, "SLC DISCONNECTED — re-enabling connectable/discoverable so CMF Buds can auto-reconnect");
+                
+                // Re-enable visibility scan modes so the earbuds can find and auto-reconnect to us in the background
+                esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+                
                 memset(g_remote_bda, 0, ESP_BD_ADDR_LEN);
                 g_audio_started = false;
             }

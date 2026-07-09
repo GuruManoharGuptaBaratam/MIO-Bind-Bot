@@ -17,6 +17,9 @@ static const char *TAG = "TFT_DISPLAY";
 #define TFT_WIDTH      160
 #define TFT_HEIGHT     128
 
+// Custom mid-dark gray color in standard 16-bit RGB565 format
+#define ST77_CUSTOM_DARKGREY  0x4208 
+
 static ST7735_GFX *s_gfx = nullptr;
 static bool s_bt_connected = false;
 
@@ -43,9 +46,9 @@ typedef enum {
     TFT_STATE_LISTENING_COMMAND,
     TFT_STATE_COMMAND_UNRECOGNIZED, // Transient (3s hold) — drops to eyes
     TFT_STATE_COMMAND_TIMEOUT,      // Transient (3s hold) — drops to eyes
-    TFT_STATE_CMD_KANSEI,           // Transient (3s hold) — drops to eyes
-    TFT_STATE_CMD_KIROKU,           // Transient (3s hold) — drops to eyes
-    TFT_STATE_CMD_IBASHO,           // Transient (3s hold) — drops to eyes
+    TFT_STATE_CMD_KANSEI,            // Transient (3s hold) — drops to eyes
+    TFT_STATE_CMD_KIROKU,            // Transient (3s hold) — drops to eyes
+    TFT_STATE_CMD_IBASHO,            // Transient (3s hold) — drops to eyes
 } tft_state_t;
 
 typedef struct {
@@ -78,7 +81,6 @@ static void state_timeout_callback(void *arg);
 // Custom vector drawing for crisp, professional Bluetooth symbols
 static void draw_bluetooth_symbol(int cx, int cy, uint16_t color, bool connected)
 {
-    // Draw classic sharp Bluetooth icon outline
     s_gfx->drawLine(cx, cy - 20, cx, cy + 20, color);
     s_gfx->drawLine(cx, cy - 20, cx + 10, cy - 10, color);
     s_gfx->drawLine(cx + 10, cy - 10, cx - 10, cy + 10, color);
@@ -86,9 +88,8 @@ static void draw_bluetooth_symbol(int cx, int cy, uint16_t color, bool connected
     s_gfx->drawLine(cx + 10, cy + 10, cx, cy + 20, color);
 
     if (!connected) {
-        // Draw a prominent striking slash across the icon to symbolize disconnected state
         s_gfx->drawLine(cx - 18, cy - 15, cx + 18, cy + 15, ST77_RED);
-        s_gfx->drawLine(cx - 18, cy - 14, cx + 18, cy + 16, ST77_RED); // Thicken line slightly
+        s_gfx->drawLine(cx - 18, cy - 14, cx + 18, cy + 16, ST77_RED); 
     }
 }
 
@@ -114,26 +115,31 @@ static void render_state(tft_state_t state)
     s_gfx->fillRect(0, 0, TFT_WIDTH, TFT_HEIGHT, ST77_BLACK);
 
     if (state == TFT_STATE_IDLE_MIO) {
-        // Position MIO branding text at bottom edge
+        // Enlarge MIO branding text to size 2 and center it toward the bottom layout area
         s_gfx->setTextColor(entry->color);
-        s_gfx->setTextSize(1);
-        s_gfx->setCursor(TFT_WIDTH / 2 - 12, TFT_HEIGHT - 14);
+        s_gfx->setTextSize(2);
+        s_gfx->setCursor(TFT_WIDTH / 2 - 18, TFT_HEIGHT - 32);
         s_gfx->print(entry->label);
+
+        // Render system timestamp directly under MIO name
+        s_gfx->setTextColor(ST77_CUSTOM_DARKGREY);
+        s_gfx->setTextSize(1);
+        s_gfx->setCursor(TFT_WIDTH / 2 - 15, TFT_HEIGHT - 14);
+        
+        // System timestamp placeholder (e.g. 21:55)
+        s_gfx->print("21:55"); 
     } 
     else if (state == TFT_STATE_BT_CONNECTED || state == TFT_STATE_BT_DISCONNECTED) {
-        // Dedicated center graphic layout for Bluetooth status changes
         bool is_conn = (state == TFT_STATE_BT_CONNECTED);
         draw_bluetooth_symbol(TFT_WIDTH / 2, TFT_HEIGHT / 2 - 15, entry->color, is_conn);
         
         s_gfx->setTextColor(entry->color);
         s_gfx->setTextSize(1);
-        // Center text string under symbol footprint
         int text_offset = (state == TFT_STATE_BT_CONNECTED) ? 27 : 36;
         s_gfx->setCursor(TFT_WIDTH / 2 - text_offset, TFT_HEIGHT / 2 + 18);
         s_gfx->print(entry->label);
     } 
     else {
-        // Text alignment layout for general operational labels
         s_gfx->setTextColor(entry->color);
         s_gfx->setTextSize(2);
         s_gfx->setCursor(4, TFT_HEIGHT / 2 - 8);
@@ -145,34 +151,40 @@ static void render_state(tft_state_t state)
     ESP_LOGI(TAG, "Display -> %s", entry->label);
 }
 
-// ── Idle eye animation ───────────────────────────────────────────────────
+// ── Unique Biomorphic Colored Eye Animation ────────────────────────────────
 #define EYE_W        30
 #define EYE_H        40
-#define EYE_Y        30                          
+#define EYE_Y        22  // Shifted up slightly to accommodate the larger text space below                        
 #define EYE_L_X      35                           
 #define EYE_R_X      95                           
-#define PUPIL_W      10
-#define PUPIL_H_OPEN 16
-#define PUPIL_H_BLINK 3
+#define PUPIL_W      12
+#define PUPIL_H_OPEN 18
+#define PUPIL_H_BLINK 2
 
 #define EYES_CLEAR_X   20
-#define EYES_CLEAR_Y   25
+#define EYES_CLEAR_Y   15
 #define EYES_CLEAR_W   120
-#define EYES_CLEAR_H   50
+#define EYES_CLEAR_H   52
 
 typedef struct { int8_t pupil_dx; bool blink; } eye_frame_t;
 static const eye_frame_t kEyeFrames[] = {
-    { 0, false}, {-8, false}, { 0, false},
-    { 8, false}, { 0, false}, { 0, true },
+    { 0, false}, {-6, false}, { 0, false},
+    { 6, false}, { 0, false}, { 0, true },
 };
 #define EYE_FRAME_COUNT (sizeof(kEyeFrames) / sizeof(kEyeFrames[0]))
 
-static void draw_eye(int x, int dx, int pupil_h)
+static void draw_eye(int x, int dx, int pupil_h, bool blink)
 {
-    s_gfx->fillRect(x, EYE_Y, EYE_W, EYE_H, ST77_WHITE);
-    int pupil_x = x + (EYE_W - PUPIL_W) / 2 + dx;
-    int pupil_y = EYE_Y + (EYE_H - pupil_h) / 2;
-    s_gfx->fillRect(pupil_x, pupil_y, PUPIL_W, pupil_h, ST77_BLACK);
+    if (blink) {
+        // Draw standard closed blinking slit expression
+        s_gfx->fillRect(x, EYE_Y + (EYE_H / 2) - 1, EYE_W, pupil_h, ST77_CYAN);
+    } else {
+        // High contrast styling: Unique Cyan sclera shell with an Orange iris track core
+        s_gfx->fillRect(x, EYE_Y, EYE_W, EYE_H, ST77_CYAN);
+        int pupil_x = x + (EYE_W - PUPIL_W) / 2 + dx;
+        int pupil_y = EYE_Y + (EYE_H - pupil_h) / 2;
+        s_gfx->fillRect(pupil_x, pupil_y, PUPIL_W, pupil_h, ST77_ORANGE);
+    }
 }
 
 static void draw_idle_eyes_frame(const eye_frame_t &f)
@@ -184,8 +196,8 @@ static void draw_idle_eyes_frame(const eye_frame_t &f)
     }
     s_gfx->fillRect(EYES_CLEAR_X, EYES_CLEAR_Y, EYES_CLEAR_W, EYES_CLEAR_H, ST77_BLACK);
     int pupil_h = f.blink ? PUPIL_H_BLINK : PUPIL_H_OPEN;
-    draw_eye(EYE_L_X, f.pupil_dx, pupil_h);
-    draw_eye(EYE_R_X, f.pupil_dx, pupil_h);
+    draw_eye(EYE_L_X, f.pupil_dx, pupil_h, f.blink);
+    draw_eye(EYE_R_X, f.pupil_dx, pupil_h, f.blink);
     xSemaphoreGive(s_gfx_mutex);
 }
 
@@ -207,18 +219,15 @@ static void idle_eyes_task(void *arg)
 static void state_timeout_callback(void *arg)
 {
     ESP_LOGI(TAG, "State timeout reached. Reverting to moving eyes baseline.");
-    // Uniformly revert back to the dynamic moving eyes screen regardless of source trace
     request_state(TFT_STATE_IDLE_MIO);
 }
 
 static void request_state(tft_state_t state)
 {
-    // Terminate running hardware timers immediately on new state arrivals
     if (s_state_timeout_timer && esp_timer_is_active(s_state_timeout_timer)) {
         esp_timer_stop(s_state_timeout_timer);
     }
 
-    // Toggle active eye rendering context variables relative to base view target
     if (state != TFT_STATE_IDLE_MIO) {
         s_idle_active = false;
     }
@@ -229,7 +238,6 @@ static void request_state(tft_state_t state)
         s_idle_active = true;
     }
 
-    // Isolate notification alerts vs processing commands for tailored timeout schedules
     bool is_command_state = (state == TFT_STATE_WAKEWORD_DETECTED ||
                              state == TFT_STATE_COMMAND_UNRECOGNIZED ||
                              state == TFT_STATE_COMMAND_TIMEOUT ||
@@ -299,7 +307,6 @@ void tft_display_on_ie_event(core_event_t evt)
         return;
     }
     switch (evt) {
-        // Dropped text rendering for listening updates; handles operations purely behind the scenes
         case CORE_EVT_LISTENING_WAKEWORD:                                           break; 
         case CORE_EVT_WAKEWORD_DETECTED:    request_state(TFT_STATE_WAKEWORD_DETECTED);    break;
         case CORE_EVT_COUNTDOWN_3:          request_state(TFT_STATE_COUNTDOWN_3);          break;
@@ -322,3 +329,4 @@ void tft_display_on_ie_command(core_command_t cmd)
         case CORE_CMD_IBASHO: request_state(TFT_STATE_CMD_IBASHO); break;
     }
 }
+
