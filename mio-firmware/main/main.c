@@ -10,9 +10,14 @@
 #include "hfp_manager.h"
 #include "core_uart_receiver.h"
 #include "tft_display.h"
+#include "sd_config.h"
+#include "esp_timer.h"
 
 static const char *TAG = "MIO_BT";
 
+// Default/fallback earbuds address — overwritten by SD config at boot if
+// BT_MAC is present and valid. Kept as a fallback so the bot is still
+// bench-testable with SD removed.
 static  esp_bd_addr_t CMF_BUDS_ADDR = {
     0x3C,
     0xB0,
@@ -104,6 +109,31 @@ void app_main(void)
         nvs_flash_init()
     );
 
+    // Display must be up first — everything below this point may need to
+    // show status on screen (SD result, then BT/inference states as before).
+    tft_display_init();
+
+    // SD is read once, before anything else touches Bluetooth or the
+    // inference link. Insert-before-boot only — no re-read after this.
+    ESP_LOGI(TAG, "Reading SD config");
+    ESP_LOGI(TAG, "SD load: START, tick=%lld", esp_timer_get_time());
+    esp_err_t sd_ret = sd_config_load();
+    ESP_LOGI(TAG, "SD load: END, tick=%lld, ret=%s", esp_timer_get_time(), esp_err_to_name(sd_ret));
+
+    if (sd_ret == ESP_OK && g_sd_config.bt_mac_valid) {
+        memcpy(CMF_BUDS_ADDR, g_sd_config.bt_mac, sizeof(CMF_BUDS_ADDR));
+        ESP_LOGI(TAG, "CMF_BUDS_ADDR overridden from SD config");
+        tft_display_on_sd_status(SD_BOOT_OK);
+    } else if (sd_ret == ESP_ERR_NOT_FOUND || sd_ret == ESP_ERR_INVALID_RESPONSE
+               || sd_ret == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "SD card not detected/mountable — using fallback CMF_BUDS_ADDR");
+        tft_display_on_sd_status(SD_BOOT_NOT_FOUND);
+    } else {
+        ESP_LOGW(TAG, "SD mounted but config invalid/missing BT_MAC — using fallback CMF_BUDS_ADDR");
+        tft_display_on_sd_status(SD_BOOT_BAD_CONFIG);
+    }
+    // tft_display_on_sd_status(SD_BOOT_NOT_FOUND); // test one
+
     ESP_LOGI(TAG, "Starting Bluetooth");
 
     esp_bt_controller_config_t bt_cfg =
@@ -169,9 +199,6 @@ void app_main(void)
     );
 
     ESP_LOGI(TAG, "Started Bluetooth Scan");
-
-    // Display must be up before any inference-link packets can be shown.
-    tft_display_init();
 
     // Independent peripheral from BT/HFP — order relative to hfp_init()
     // doesn't matter. Routes every inference-engine command/event straight

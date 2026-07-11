@@ -124,7 +124,15 @@ void core_uart_receiver_init(void)
                                   CORE_IE_UART_TX_PIN, CORE_IE_UART_RX_PIN,
                                   UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    xTaskCreate(core_uart_rx_task, "core_uart_rx", 3072, NULL, 10, NULL);
+    // Pinned to core 0, deliberately away from mio_i2s_feeder_task
+    // (priority 22, pinned to core 1 in hfp_manager.c). This task calls
+    // into tft_display_on_ie_event()/on_ie_command(), which take
+    // s_gfx_mutex and do blocking SPI draws — if this task shared core 1
+    // with the priority-22 audio feeder, it could get starved mid-draw
+    // while holding that mutex, freezing the display's idle_eyes_task
+    // (which then blocks forever on the same mutex). Keeping every
+    // display-touching task off core 1 avoids that priority inversion.
+    xTaskCreatePinnedToCore(core_uart_rx_task, "core_uart_rx", 3072, NULL, 10, NULL, 0);
 
     ESP_LOGI(TAG, "Inference-link UART initialized (RX on GPIO%d, %d baud)",
              CORE_IE_UART_RX_PIN, CORE_IE_UART_BAUD);

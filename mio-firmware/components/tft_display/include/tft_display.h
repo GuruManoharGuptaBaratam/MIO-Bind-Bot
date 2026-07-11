@@ -1,6 +1,7 @@
 #pragma once
 #include <stdbool.h>
 #include "core_uart_receiver.h"
+#include "sd_config.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,6 +23,8 @@ void tft_display_on_bt_state(bool connected);
 // core_event_cb_t exactly.
 void tft_display_on_ie_event(core_event_t evt);
 void tft_display_on_ie_command(core_command_t cmd);
+void tft_display_on_sd_status(sd_boot_status_t status);
+
 
 #ifdef __cplusplus
 }

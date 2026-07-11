@@ -139,7 +139,9 @@ bool ST7735_GFX::begin()
     spi_bus_config_t buscfg = {};
     buscfg.sclk_io_num = _cfg.pin_sclk;
     buscfg.mosi_io_num = _cfg.pin_mosi;
-    buscfg.miso_io_num = -1;
+    buscfg.miso_io_num = 34; // SD card's MISO — TFT itself never reads,
+                              // but this bus is now shared with sd_config.c,
+                              // which needs this line actually routed.
     buscfg.quadwp_io_num = -1;
     buscfg.quadhd_io_num = -1;
     buscfg.max_transfer_sz = _cfg.width * _cfg.height * 2; // full-frame RGB565 worst case
