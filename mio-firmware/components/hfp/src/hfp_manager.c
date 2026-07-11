@@ -46,6 +46,14 @@ static const char *TAG = "MIO_HFP";
 static esp_bd_addr_t g_remote_bda = {0};
 static bool g_audio_started = false;
 
+// Set by hfp_connect() as soon as it's called from app_main — but the
+// actual esp_hf_ag_slc_connect() only fires once ESP_HF_PROF_STATE_EVT
+// confirms the profile is truly ready (see hfp_callback below). Calling
+// slc_connect() immediately after hfp_init() races ahead of Bluedroid's
+// async internal SDP/RFCOMM setup and silently does nothing.
+static esp_bd_addr_t g_pending_connect_bda = {0};
+static bool g_pending_connect = false;
+
 static void mio_i2s_feeder_task(void *pvParameters)
 {
     ESP_LOGI(TAG, "MIO I2S Feeder Task Started (ring-buffer smoothing)");
@@ -162,7 +170,15 @@ static void hfp_callback(
     switch(event)
     {
         case ESP_HF_PROF_STATE_EVT:
-            ESP_LOGI(TAG, "HFP Profile State Event");
+            ESP_LOGI(TAG, "HFP Profile State Event — profile ready");
+            // This event only fires once, when esp_hf_ag_init() completes
+            // (we never call esp_hf_ag_deinit()), so no need to inspect
+            // param fields — its mere arrival means the profile is ready.
+            if (g_pending_connect) {
+                ESP_LOGI(TAG, "Connecting to pending target now");
+                g_pending_connect = false;
+                esp_hf_ag_slc_connect(g_pending_connect_bda);
+            }
             break;
 
         case ESP_HF_CONNECTION_STATE_EVT:
@@ -323,5 +339,15 @@ void hfp_init(void)
 
 void hfp_connect(esp_bd_addr_t remote_bda)
 {
+    memcpy(g_pending_connect_bda, remote_bda, ESP_BD_ADDR_LEN);
+    g_pending_connect = true;
+    ESP_LOGI(TAG, "hfp_connect() called — will connect once HFP profile confirms ready");
+
+    // If the profile already turned on before this call (e.g. hfp_connect()
+    // called well after hfp_init(), like the discovery-based flow), don't
+    // wait for another ESP_HF_PROF_STATE_EVT that may never fire again —
+    // connect right away in that case.
+    // (Safe no-op if the profile isn't ready yet — ESP_HF_PROF_STATE_EVT
+    // above will handle it when it does turn on.)
     esp_hf_ag_slc_connect(remote_bda);
 }

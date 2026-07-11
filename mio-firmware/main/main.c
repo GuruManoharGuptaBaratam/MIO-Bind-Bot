@@ -1,4 +1,3 @@
-#include "ble_manager.h"
 #include <stdio.h>
 #include "esp_log.h"
 #include "esp_bt.h"
@@ -7,7 +6,6 @@
 #include "esp_gap_bt_api.h"
 #include "hfp_manager.h"
 #include <string.h>
-#include "hfp_manager.h"
 #include "core_uart_receiver.h"
 #include "tft_display.h"
 #include "sd_config.h"
@@ -87,12 +85,17 @@ static void bt_gap_callback(
                      "Discovery State Changed: %d",
                      param->disc_st_chg.state);
             break;
-        case ESP_BT_GAP_PIN_REQ_EVT:
-            ESP_LOGI(TAG, "PIN REQUEST");
+        case ESP_BT_GAP_PIN_REQ_EVT: {
+            ESP_LOGI(TAG, "PIN REQUEST — auto-replying with legacy PIN 0000");
+            esp_bt_pin_code_t pin_code = {'0','0','0','0'};
+            esp_bt_gap_pin_reply(param->pin_req.bda, true, 4, pin_code);
             break;
+        }
 
         case ESP_BT_GAP_CFM_REQ_EVT:
-            ESP_LOGI(TAG, "CONFIRMATION REQUEST");
+            ESP_LOGI(TAG, "CONFIRMATION REQUEST (num_val=%lu) — auto-accepting",
+                     param->cfm_req.num_val);
+            esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
             break;
 
         case ESP_BT_GAP_AUTH_CMPL_EVT:
@@ -189,6 +192,11 @@ void app_main(void)
         )
     );
 
+    // hfp_init() must run before discovery starts, so the HFP profile is
+    // fully registered by the time a matching device triggers hfp_connect()
+    // from inside the GAP callback.
+    hfp_init();
+
     ESP_LOGI(TAG, "MIO Discoverable");
     ESP_ERROR_CHECK(
     esp_bt_gap_start_discovery(
@@ -205,6 +213,4 @@ void app_main(void)
     // to the display.
     core_uart_receiver_set_callbacks(tft_display_on_ie_command, tft_display_on_ie_event);
     core_uart_receiver_init();
-
-    hfp_init();
 }
