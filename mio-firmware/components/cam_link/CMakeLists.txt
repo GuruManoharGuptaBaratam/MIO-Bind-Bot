@@ -1,0 +1,6 @@
+idf_component_register(
+    SRCS "src/cam_link.c"
+    INCLUDE_DIRS "include"
+    REQUIRES driver core_uart_receiver
+    PRIV_REQUIRES esp_driver_uart
+)

@@ -11,6 +11,9 @@
 #include "sd_config.h"
 #include "esp_timer.h"
 
+#include "job_dispatcher.h"
+
+
 static const char *TAG = "MIO_BT";
 
 // Default/fallback earbuds address — overwritten by SD config at boot if
@@ -211,6 +214,7 @@ void app_main(void)
     // Independent peripheral from BT/HFP — order relative to hfp_init()
     // doesn't matter. Routes every inference-engine command/event straight
     // to the display.
-    core_uart_receiver_set_callbacks(tft_display_on_ie_command, tft_display_on_ie_event);
+    job_dispatcher_init();
+    core_uart_receiver_set_callbacks(job_dispatcher_on_command, job_dispatcher_on_event);
     core_uart_receiver_init();
 }

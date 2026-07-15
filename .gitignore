@@ -13,6 +13,7 @@
 
 mio-firmware/managed_components/
 mio-inference/managed_components/
+mio-cam/managed_components/
 
 .DS_Store
 /working-backup( when any issue )
