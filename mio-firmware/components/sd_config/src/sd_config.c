@@ -204,7 +204,7 @@ esp_err_t sd_config_load(void)
     // clean, short PCB traces — breadboard jumper wires can't reliably
     // carry that; the card mounts but reads start failing (BAD CONFIG).
     // 1MHz is a safe, solid middle ground for jumper-wire prototyping.
-    host.max_freq_khz = 4000;
+    host.max_freq_khz = 2000;
 
     // NOTE: no spi_bus_initialize() here on purpose. tft_display_init()
     // already called spi_bus_initialize(SPI2_HOST, ...) before this runs.
