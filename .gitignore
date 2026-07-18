@@ -2,7 +2,7 @@
 **/build/
 
 **/sdkconfig.old
-
+example.txt
 
 **/__pycache__/
 **/*.py[cod]
