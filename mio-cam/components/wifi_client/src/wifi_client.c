@@ -116,7 +116,7 @@ esp_err_t wifi_client_init(const char *ssid, const char *password)
      * what actually kicks off RF calibration and draws the current
      * spike. We defer that to wifi_client_connect() so it only
      * happens right when you need it, not automatically at boot. */
-
+    ESP_LOGI(TAG, "attempting SSID: '%s' (len=%d)", s_ssid, strlen(s_ssid));
     s_initialized = true;
     ESP_LOGI(TAG, "wifi_client_init done (radio not started yet)");
     return ESP_OK;

@@ -5,5 +5,5 @@
  * from config.txt on the SD card. Move these back out once that's
  * built -- don't commit real credentials to a public repo. */
 
-#define WIFI_SSID     "Airtel_Zerotouch_5G"
+#define WIFI_SSID     "Manohar"
 #define WIFI_PASSWORD "geethika"
