@@ -28,6 +28,17 @@ static int s_retry_count = 0;
 static bool s_initialized = false;
 static bool s_connected = false;
 
+/* Set right before a deliberate wifi_client_disconnect() call, so the
+ * event handler can tell "disconnect I asked for" apart from "the
+ * connection dropped unexpectedly". Without this, esp_wifi_disconnect()
+ * generates the same WIFI_EVENT_STA_DISCONNECTED event as a real drop,
+ * and the handler would immediately try to reconnect right as
+ * wifi_client_disconnect() goes on to call esp_wifi_stop() -- a race
+ * that happened to not crash the one time it was observed, but isn't
+ * something to leave in place for repeated per-job connect/disconnect
+ * cycling. */
+static bool s_disconnect_requested = false;
+
 static char s_ssid[33] = {0};
 static char s_password[65] = {0};
 
@@ -38,7 +49,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         s_connected = false;
-        if (s_retry_count < WIFI_CONNECT_MAX_RETRIES) {
+        if (s_disconnect_requested) {
+            // Intentional disconnect -- don't auto-reconnect.
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        } else if (s_retry_count < WIFI_CONNECT_MAX_RETRIES) {
             esp_wifi_connect();
             s_retry_count++;
             ESP_LOGW(TAG, "retrying wifi connect (%d/%d)", s_retry_count,
@@ -116,7 +130,7 @@ esp_err_t wifi_client_init(const char *ssid, const char *password)
      * what actually kicks off RF calibration and draws the current
      * spike. We defer that to wifi_client_connect() so it only
      * happens right when you need it, not automatically at boot. */
-    ESP_LOGI(TAG, "attempting SSID: '%s' (len=%d)", s_ssid, strlen(s_ssid));
+    ESP_LOGI(TAG, "attempting SSID: '%s' (len=%d)", s_ssid, (int) strlen(s_ssid));
     s_initialized = true;
     ESP_LOGI(TAG, "wifi_client_init done (radio not started yet)");
     return ESP_OK;
@@ -133,6 +147,7 @@ esp_err_t wifi_client_connect(uint32_t timeout_ms)
     }
 
     s_retry_count = 0;
+    s_disconnect_requested = false;
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
 
     esp_err_t err = esp_wifi_start();
@@ -160,9 +175,11 @@ void wifi_client_disconnect(void)
     if (!s_initialized) {
         return;
     }
+    s_disconnect_requested = true;
     esp_wifi_disconnect();
     esp_wifi_stop();
     s_connected = false;
+    s_disconnect_requested = false;
 }
 
 bool wifi_client_is_connected(void)
