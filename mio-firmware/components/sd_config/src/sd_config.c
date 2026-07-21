@@ -85,7 +85,17 @@ static void apply_kv(const char *key, const char *value)
         g_sd_config.user_img_path[SD_CFG_PATH_MAXLEN - 1] = '\0';
         return;
     }
+    if (strcmp(key, "WIFI_SSID") == 0) {
+        strncpy(g_sd_config.wifi_ssid, value, SD_CFG_WIFI_SSID_MAXLEN - 1);
+        g_sd_config.wifi_ssid[SD_CFG_WIFI_SSID_MAXLEN - 1] = '\0';
+        return;
+    }
 
+    if (strcmp(key, "WIFI_PASS") == 0) {
+        strncpy(g_sd_config.wifi_password, value, SD_CFG_WIFI_PASS_MAXLEN - 1);
+        g_sd_config.wifi_password[SD_CFG_WIFI_PASS_MAXLEN - 1] = '\0';
+        return;
+    }
     // SOS1_NAME / SOS1_PHONE / SOS2_NAME / ... / SOS3_PHONE
     if (strncmp(key, "SOS", 3) == 0 && strlen(key) >= 5) {
         int idx = key[3] - '1';   // SOS1 -> 0, SOS2 -> 1, SOS3 -> 2
@@ -204,7 +214,7 @@ esp_err_t sd_config_load(void)
     // clean, short PCB traces — breadboard jumper wires can't reliably
     // carry that; the card mounts but reads start failing (BAD CONFIG).
     // 1MHz is a safe, solid middle ground for jumper-wire prototyping.
-    host.max_freq_khz = 2000;
+    host.max_freq_khz = 1000;
 
     // NOTE: no spi_bus_initialize() here on purpose. tft_display_init()
     // already called spi_bus_initialize(SPI2_HOST, ...) before this runs.

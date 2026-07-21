@@ -26,10 +26,16 @@ static void on_kiroku_angle(uint8_t angle_deg)
     // TODO: write a video frame to the SD card here
 }
 
-static void handle_kansei(int16_t pitch_centideg)
+static void handle_kansei(const cam_trigger_packet_t *packet)
 {
-    ESP_LOGI(TAG, "kansei job started, pitch=%.2f deg", pitch_centideg / 100.0f);
-    servo_apply_tilt_correction(pitch_centideg);
+    ESP_LOGI(TAG, "kansei job started, pitch=%.2f deg", packet->pitch_centideg / 100.0f);
+    servo_apply_tilt_correction(packet->pitch_centideg);
+
+    if (packet->has_wifi_creds) {
+        wifi_client_set_credentials(packet->ssid, packet->password);
+    }
+    // else: keep using whatever's currently set (wifi_credentials.h
+    // fallback from boot, or the last job's SD-sourced credentials)
 
     if (wifi_client_connect(10000) != ESP_OK) {
         ESP_LOGE(TAG, "kansei: wifi connect failed, aborting job");
@@ -38,18 +44,14 @@ static void handle_kansei(int16_t pitch_centideg)
     }
 
     servo_pan_sweep(on_kansei_angle);
-
     wifi_client_disconnect();
-
-    // TODO: once all angles are captured, send the scene description back
-    // to Core via uart_protocol_send_event() with real payload data.
     uart_protocol_send_event(CAM_EVENT_JOB_DONE, NULL, 0);
 }
 
-static void handle_kiroku(int16_t pitch_centideg)
+static void handle_kiroku(const cam_trigger_packet_t *packet)
 {
-    ESP_LOGI(TAG, "kiroku job started, pitch=%.2f deg", pitch_centideg / 100.0f);
-    servo_apply_tilt_correction(pitch_centideg);
+    ESP_LOGI(TAG, "kiroku job started, pitch=%.2f deg", packet->pitch_centideg / 100.0f);
+    servo_apply_tilt_correction(packet->pitch_centideg);
     servo_pan_sweep(on_kiroku_angle);
     // TODO: record 2-3 min continuous video to SD, auto-stop, then report done
     uart_protocol_send_event(CAM_EVENT_JOB_DONE, NULL, 0);
@@ -62,9 +64,9 @@ static void uart_listener_task(void *arg)
         if (uart_protocol_read_trigger(&packet) == 0) {
             uart_protocol_send_event(CAM_EVENT_JOB_STARTED, NULL, 0);
             if (packet.cmd == CAM_CMD_KANSEI) {
-                handle_kansei(packet.pitch_centideg);
+                handle_kansei(&packet);
             } else if (packet.cmd == CAM_CMD_KIROKU) {
-                handle_kiroku(packet.pitch_centideg);
+                handle_kiroku(&packet);
             } else {
                 ESP_LOGW(TAG, "Unknown command 0x%02X", packet.cmd);
                 uart_protocol_send_event(CAM_EVENT_JOB_FAILED, NULL, 0);

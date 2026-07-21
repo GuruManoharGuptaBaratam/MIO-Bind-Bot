@@ -60,15 +60,58 @@ int uart_protocol_read_trigger(cam_trigger_packet_t *out_packet) {
         return -1;
     }
 
-    // FIX 1: Change body array size from 4 to 3 [cmd, pitch_hi, pitch_lo]
-    uint8_t body[3]; 
-    len = uart_read_bytes(UART_PORT_NUM, body, sizeof(body), pdMS_TO_TICKS(50));
-    if (len != sizeof(body)) {
-        ESP_LOGW(TAG, "Incomplete trigger frame body (%d/%d bytes)", len, (int)sizeof(body));
+    uint8_t fixed[3]; // cmd, pitch_hi, pitch_lo
+    len = uart_read_bytes(UART_PORT_NUM, fixed, sizeof(fixed), pdMS_TO_TICKS(50));
+    if (len != sizeof(fixed)) {
+        ESP_LOGW(TAG, "Incomplete trigger frame fixed body (%d/%d bytes)", len, (int)sizeof(fixed));
         return -1;
     }
 
-    // FIX 2: Explicitly read the 1-byte checksum that follows the body
+    // Checksum now covers fixed body + both variable fields. Max size:
+    // 3 (fixed) + 1 (ssid_len) + 32 (ssid) + 1 (pass_len) + 64 (password) = 101 bytes.
+    uint8_t cksum_buf[3 + 1 + UART_MAX_SSID_LEN + 1 + UART_MAX_PASSWORD_LEN];
+    uint16_t cksum_idx = 0;
+    memcpy(&cksum_buf[cksum_idx], fixed, sizeof(fixed));
+    cksum_idx += sizeof(fixed);
+
+    uint8_t ssid_len;
+    len = uart_read_bytes(UART_PORT_NUM, &ssid_len, 1, pdMS_TO_TICKS(20));
+    if (len != 1 || ssid_len > UART_MAX_SSID_LEN) {
+        ESP_LOGW(TAG, "Bad ssid_len byte (%d)", ssid_len);
+        return -1;
+    }
+    cksum_buf[cksum_idx++] = ssid_len;
+
+    char ssid[UART_MAX_SSID_LEN + 1] = {0};
+    if (ssid_len > 0) {
+        len = uart_read_bytes(UART_PORT_NUM, (uint8_t *)ssid, ssid_len, pdMS_TO_TICKS(50));
+        if (len != ssid_len) {
+            ESP_LOGW(TAG, "Incomplete ssid field (%d/%d bytes)", len, ssid_len);
+            return -1;
+        }
+        memcpy(&cksum_buf[cksum_idx], ssid, ssid_len);
+        cksum_idx += ssid_len;
+    }
+
+    uint8_t pass_len;
+    len = uart_read_bytes(UART_PORT_NUM, &pass_len, 1, pdMS_TO_TICKS(20));
+    if (len != 1 || pass_len > UART_MAX_PASSWORD_LEN) {
+        ESP_LOGW(TAG, "Bad pass_len byte (%d)", pass_len);
+        return -1;
+    }
+    cksum_buf[cksum_idx++] = pass_len;
+
+    char password[UART_MAX_PASSWORD_LEN + 1] = {0};
+    if (pass_len > 0) {
+        len = uart_read_bytes(UART_PORT_NUM, (uint8_t *)password, pass_len, pdMS_TO_TICKS(50));
+        if (len != pass_len) {
+            ESP_LOGW(TAG, "Incomplete password field (%d/%d bytes)", len, pass_len);
+            return -1;
+        }
+        memcpy(&cksum_buf[cksum_idx], password, pass_len);
+        cksum_idx += pass_len;
+    }
+
     uint8_t checksum;
     len = uart_read_bytes(UART_PORT_NUM, &checksum, 1, pdMS_TO_TICKS(20));
     if (len != 1) {
@@ -76,28 +119,29 @@ int uart_protocol_read_trigger(cam_trigger_packet_t *out_packet) {
         return -1;
     }
 
-    // FIX 3: Calculate the checksum over the 3 body bytes only
-    if (uart_protocol_checksum(body, sizeof(body)) != checksum) {
+    if (uart_protocol_checksum(cksum_buf, cksum_idx) != checksum) {
         ESP_LOGW(TAG, "Checksum mismatch on trigger frame, dropping");
         return -1;
     }
 
-    // FIX 4: Consume the 2 termination bytes (\r\n) cleanly from the buffer
     uint8_t term[2];
     uart_read_bytes(UART_PORT_NUM, term, sizeof(term), pdMS_TO_TICKS(20));
 
-    // Map extracted elements to the output packet structure
     out_packet->header = FRAME_HEADER_CMD;
-    out_packet->cmd = body[0];
-    out_packet->pitch_centideg = (int16_t)((body[1] << 8) | body[2]);
+    out_packet->cmd = fixed[0];
+    out_packet->pitch_centideg = (int16_t)((fixed[1] << 8) | fixed[2]);
     out_packet->checksum = checksum;
+    memcpy(out_packet->ssid, ssid, sizeof(ssid));
+    memcpy(out_packet->password, password, sizeof(password));
+    out_packet->has_wifi_creds = (ssid_len > 0);
 
-    ESP_LOGI(TAG, "Trigger received: cmd=0x%02X pitch=%.2f deg", out_packet->cmd, out_packet->pitch_centideg / 100.0f);
+    ESP_LOGI(TAG, "Trigger received: cmd=0x%02X pitch=%.2f deg wifi_creds=%s",
+             out_packet->cmd, out_packet->pitch_centideg / 100.0f,
+             out_packet->has_wifi_creds ? "yes" : "no");
 
-    // Visual confirmation via status LED
-    gpio_set_level(DEBUG_LED_PIN, 0); 
+    gpio_set_level(DEBUG_LED_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(80));
-    gpio_set_level(DEBUG_LED_PIN, 1); 
+    gpio_set_level(DEBUG_LED_PIN, 1);
 
     return 0;
 }

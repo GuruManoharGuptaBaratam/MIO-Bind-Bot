@@ -49,6 +49,19 @@ void wifi_client_disconnect(void);
 
 bool wifi_client_is_connected(void);
 
+
+/**
+ * wifi_client_set_credentials()
+ *
+ * Updates SSID/password on an already-initialized client without
+ * re-running nvs_flash_init()/esp_wifi_init() (those must only ever
+ * run once). If currently connected, disconnects first. Call this
+ * before wifi_client_connect() when a trigger packet carries fresh
+ * credentials from Core's SD config.
+ */
+esp_err_t wifi_client_set_credentials(const char *ssid, const char *password);
+
+
 /**
  * http_send_image_frame()
  *

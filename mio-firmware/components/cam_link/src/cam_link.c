@@ -1,8 +1,10 @@
 #include "cam_link.h"
+#include "sd_config.h"
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <string.h>
 
 static const char *TAG = "CAM_LINK";
 
@@ -39,18 +41,56 @@ void cam_link_send_trigger(core_command_t cmd, int16_t pitch_centideg)
 
     uint8_t pitch_hi = (uint8_t)((pitch_centideg >> 8) & 0xFF);
     uint8_t pitch_lo = (uint8_t)(pitch_centideg & 0xFF);
-    uint8_t body[3] = { (uint8_t)cmd, pitch_hi, pitch_lo };
-    uint8_t checksum = xor_checksum(body, sizeof(body));
+    uint8_t fixed[3] = { (uint8_t)cmd, pitch_hi, pitch_lo };
 
-    uint8_t frame[5] = { FRAME_HEADER_CMD, body[0], body[1], body[2], checksum };
-    uart_write_bytes(CAM_UART_NUM, (const char *)frame, sizeof(frame));
+    // Pulls whatever sd_config_load() cached at boot. If config.txt had
+    // no WIFI_SSID= line, wifi_ssid[0] is '\0' (zeroed by the memset in
+    // sd_config_load()) -- ssid_len ends up 0, and CAM correctly falls
+    // back to its own hardcoded wifi_credentials.h.
+    uint8_t ssid_len = (uint8_t) strnlen(g_sd_config.wifi_ssid, SD_CFG_WIFI_SSID_MAXLEN - 1);
+    uint8_t pass_len = (uint8_t) strnlen(g_sd_config.wifi_password, SD_CFG_WIFI_PASS_MAXLEN - 1);
+
+    // Build the checksum buffer: fixed(3) + ssid_len(1) + ssid + pass_len(1) + password
+    // Must match the CAM side's uart_protocol_read_trigger() checksum layout exactly.
+    uint8_t cksum_buf[3 + 1 + (SD_CFG_WIFI_SSID_MAXLEN - 1) + 1 + (SD_CFG_WIFI_PASS_MAXLEN - 1)];
+    uint16_t idx = 0;
+    memcpy(&cksum_buf[idx], fixed, sizeof(fixed));
+    idx += sizeof(fixed);
+    cksum_buf[idx++] = ssid_len;
+    if (ssid_len > 0) {
+        memcpy(&cksum_buf[idx], g_sd_config.wifi_ssid, ssid_len);
+        idx += ssid_len;
+    }
+    cksum_buf[idx++] = pass_len;
+    if (pass_len > 0) {
+        memcpy(&cksum_buf[idx], g_sd_config.wifi_password, pass_len);
+        idx += pass_len;
+    }
+
+    uint8_t checksum = xor_checksum(cksum_buf, idx);
+
+    // Write the frame in pieces -- simpler than building one giant
+    // contiguous buffer, and uart_write_bytes() blocks until queued
+    // anyway so partial writes aren't a correctness concern here.
+    uint8_t header = FRAME_HEADER_CMD;
+    uart_write_bytes(CAM_UART_NUM, (const char *)&header, 1);
+    uart_write_bytes(CAM_UART_NUM, (const char *)fixed, sizeof(fixed));
+    uart_write_bytes(CAM_UART_NUM, (const char *)&ssid_len, 1);
+    if (ssid_len > 0) {
+        uart_write_bytes(CAM_UART_NUM, g_sd_config.wifi_ssid, ssid_len);
+    }
+    uart_write_bytes(CAM_UART_NUM, (const char *)&pass_len, 1);
+    if (pass_len > 0) {
+        uart_write_bytes(CAM_UART_NUM, g_sd_config.wifi_password, pass_len);
+    }
+    uart_write_bytes(CAM_UART_NUM, (const char *)&checksum, 1);
 
     uint8_t term[2] = { 0x0D, 0x0A };
     uart_write_bytes(CAM_UART_NUM, (const char *)term, sizeof(term));
 
-    ESP_LOGI(TAG, "Sent trigger cmd=0x%02X pitch=%.2f deg to CAM", cmd, pitch_centideg / 100.0f);
+    ESP_LOGI(TAG, "Sent trigger cmd=0x%02X pitch=%.2f deg to CAM (wifi_creds=%s)",
+             cmd, pitch_centideg / 100.0f, ssid_len > 0 ? "yes" : "no");
 }
-
 // NOTE: assumes a zero-payload event frame (event byte + checksum only),
 // matching the CAM stub's current uart_protocol_send_event(evt, NULL, 0)
 // calls. Once CAM starts sending real payloads (e.g. scene description

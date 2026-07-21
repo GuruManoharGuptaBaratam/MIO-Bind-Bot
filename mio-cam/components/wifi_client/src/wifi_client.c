@@ -69,6 +69,47 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
+
+esp_err_t wifi_client_set_credentials(const char *ssid, const char *password)
+{
+    if (!s_initialized) {
+        ESP_LOGE(TAG, "call wifi_client_init() first");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (ssid == NULL || strlen(ssid) == 0 || strlen(ssid) > sizeof(s_ssid) - 1) {
+        ESP_LOGE(TAG, "invalid ssid");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_connected) {
+        ESP_LOGW(TAG, "changing credentials while connected -- disconnecting first");
+        wifi_client_disconnect();
+    }
+
+    memset(s_ssid, 0, sizeof(s_ssid));
+    memset(s_password, 0, sizeof(s_password));
+    strncpy(s_ssid, ssid, sizeof(s_ssid) - 1);
+    if (password != NULL) {
+        strncpy(s_password, password, sizeof(s_password) - 1);
+    }
+
+    wifi_config_t wifi_config = {0};
+    strncpy((char *) wifi_config.sta.ssid, s_ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *) wifi_config.sta.password, s_password, sizeof(wifi_config.sta.password) - 1);
+    wifi_config.sta.threshold.authmode = strlen(s_password) == 0
+                                              ? WIFI_AUTH_OPEN
+                                              : WIFI_AUTH_WPA2_PSK;
+
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_config failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "credentials updated: SSID='%s'", s_ssid);
+    return ESP_OK;
+}
+
+
 esp_err_t wifi_client_init(const char *ssid, const char *password)
 {
     if (s_initialized) {

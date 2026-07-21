@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <stdbool.h>
 
 // DRAFT FRAMING - align with Core's inference_engine header once shared.
 // Core -> CAM: [0xAA][cmd][pitch_hi][pitch_lo][checksum][0x0D][0x0A]
@@ -9,6 +10,9 @@
 #define FRAME_HEADER_EVENT  0xBB   // CAM -> Core reply/event frame
 #define FRAME_TERM_1        0x0D
 #define FRAME_TERM_2        0x0A
+
+#define UART_MAX_SSID_LEN      32
+#define UART_MAX_PASSWORD_LEN  64
 
 typedef enum {
     CAM_CMD_KANSEI = 0x01,
@@ -26,6 +30,9 @@ typedef struct {
     uint8_t cmd;
     int16_t pitch_centideg;   // live IMU pitch angle * 100, e.g. 1234 = 12.34 deg
     uint8_t checksum;
+    char    ssid[UART_MAX_SSID_LEN + 1];       
+    char    password[UART_MAX_PASSWORD_LEN + 1]; 
+    bool    has_wifi_creds;                      
 } cam_trigger_packet_t;
 
 void uart_protocol_init(void);

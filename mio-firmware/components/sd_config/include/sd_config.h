@@ -9,6 +9,8 @@
 #define SD_CFG_NAME_MAXLEN       32
 #define SD_CFG_PHONE_MAXLEN      20
 #define SD_CFG_PATH_MAXLEN       64
+#define SD_CFG_WIFI_SSID_MAXLEN  33   
+#define SD_CFG_WIFI_PASS_MAXLEN  65 
 
 // Simplified boot-time outcome for display purposes — collapses the
 // various esp_err_t possibilities from sd_config_load() into the three
@@ -26,18 +28,20 @@ typedef struct {
 } sos_contact_t;
 
 typedef struct {
-    uint8_t        bt_mac[6];               // parsed from BT_MAC=AA:BB:CC:DD:EE:FF
+    uint8_t        bt_mac[6];
     bool           bt_mac_valid;
 
     sos_contact_t  contacts[SD_CFG_MAX_CONTACTS];
 
-    char           user_img_path[SD_CFG_PATH_MAXLEN]; // e.g. "/user.jpg"
-    uint8_t       *user_img_buf;             // malloc'd raw JPEG bytes, NULL if not loaded
-    size_t         user_img_len;             // size in bytes, 0 if not loaded
+    char           user_img_path[SD_CFG_PATH_MAXLEN];
+    uint8_t       *user_img_buf;
+    size_t         user_img_len;
 
-    bool           loaded;                   // true if config.txt was found and parsed
+    char           wifi_ssid[SD_CFG_WIFI_SSID_MAXLEN];      // NEW: from WIFI_SSID=
+    char           wifi_password[SD_CFG_WIFI_PASS_MAXLEN];  // NEW: from WIFI_PASS=
+
+    bool           loaded;
 } sd_runtime_config_t;
-
 // Global instance — read this after sd_config_load() returns.
 extern sd_runtime_config_t g_sd_config;
 
