@@ -32,7 +32,7 @@ static const char *TAG = "SERVO";
 // correction is zero (device held level).
 #define BASE_TILT_ANGLE_DEG   90
 
-static const uint8_t PAN_SWEEP_ANGLES[] = { 20, 90, 170 };
+static const uint8_t PAN_SWEEP_ANGLES[] = { 20, 90, 165 };
 #define PAN_SWEEP_STEPS  (sizeof(PAN_SWEEP_ANGLES) / sizeof(PAN_SWEEP_ANGLES[0]))
 
 #define PAN_SLEW_STEP_DEG        2
