@@ -9,31 +9,111 @@
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
 #include "sdmmc_cmd.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "esp_rom_crc.h"  // Built-in ROM CRC32 (no mbedtls required!)
 
 static const char *TAG = "sd_config";
 
-// ---- Pin map (Core ESP32, shared SPI2 bus with TFT) ----
-// SCK/MOSI are now the SAME physical wires as the TFT (GPIO14 / GPIO13).
-// Only CS (own line) and MISO (TFT doesn't use MISO at all) are dedicated
-// to the SD card. This makes SD a second *device* on the TFT's existing
-// bus instead of a second, separately-initialized SPI hardware bus.
 #define SD_PIN_MISO  34
 #define SD_PIN_CS    21
 
 #define SD_MOUNT_POINT      "/sdcard"
 #define SD_CONFIG_FILE      SD_MOUNT_POINT "/config.txt"
-// TFT (st7735_gfx.cpp) already calls spi_bus_initialize(SPI2_HOST, ...)
-// in tft_display_init(), which MUST run before sd_config_load(). SD now
-// joins that same bus as a second device — no second bus, no init/free
-// cycle, no more disturbing the TFT's SPI state.
 #define SD_SPI_HOST         SPI2_HOST
 
 #define SD_CFG_LINE_MAXLEN  160
 
+#define NVS_NAMESPACE       "sd_cfg_cache"
+#define NVS_KEY_CONFIG      "runtime_cfg"
+#define NVS_KEY_CRC         "cfg_crc32"
+
 sd_runtime_config_t g_sd_config = {0};
 
 // ---------------------------------------------------------------------
-// Helpers
+// NVS Caching Helpers (Using ROM CRC32)
+// ---------------------------------------------------------------------
+
+static esp_err_t compute_file_crc32(const char *filepath, uint32_t *out_crc)
+{
+    FILE *f = fopen(filepath, "rb");
+    if (!f) return ESP_ERR_NOT_FOUND;
+
+    uint32_t crc = 0;
+    unsigned char buf[256];
+    size_t bytes_read = 0;
+
+    while ((bytes_read = fread(buf, 1, sizeof(buf), f)) > 0) {
+        crc = esp_rom_crc32_le(crc, buf, bytes_read);
+    }
+
+    fclose(f);
+    *out_crc = crc;
+    return ESP_OK;
+}
+
+static bool read_nvs_cache(uint32_t current_crc)
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+        return false;
+    }
+
+    uint32_t cached_crc = 0;
+    if (nvs_get_u32(handle, NVS_KEY_CRC, &cached_crc) != ESP_OK) {
+        nvs_close(handle);
+        return false;
+    }
+
+    // Check if configuration file changed
+    if (current_crc != cached_crc) {
+        ESP_LOGI(TAG, "Config file CRC32 changed (0x%08" PRIX32 " != 0x%08" PRIX32 ") -- re-parsing SD card",
+                 current_crc, cached_crc);
+        nvs_close(handle);
+        return false;
+    }
+
+    // Hash matches -- load runtime config directly from NVS
+    size_t cfg_len = sizeof(sd_runtime_config_t);
+    sd_runtime_config_t temp_cfg;
+    if (nvs_get_blob(handle, NVS_KEY_CONFIG, &temp_cfg, &cfg_len) != ESP_OK) {
+        nvs_close(handle);
+        return false;
+    }
+
+    nvs_close(handle);
+    memcpy(&g_sd_config, &temp_cfg, sizeof(sd_runtime_config_t));
+    ESP_LOGI(TAG, "NVS Cache Hit! Configuration loaded instantly from Flash NVS");
+    return true;
+}
+
+static void save_nvs_cache(uint32_t current_crc)
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_set_u32(handle, NVS_KEY_CRC, current_crc);
+        nvs_set_blob(handle, NVS_KEY_CONFIG, &g_sd_config, sizeof(sd_runtime_config_t));
+        nvs_commit(handle);
+        nvs_close(handle);
+        ESP_LOGI(TAG, "NVS Cache Updated with new SD configuration");
+    }
+}
+
+esp_err_t sd_config_clear_nvs_cache(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+        nvs_erase_all(handle);
+        nvs_commit(handle);
+        nvs_close(handle);
+        ESP_LOGI(TAG, "NVS Cache cleared");
+        return ESP_OK;
+    }
+    return ESP_FAIL;
+}
+
+// ---------------------------------------------------------------------
+// Parsing & Utility Functions
 // ---------------------------------------------------------------------
 
 static bool parse_mac(const char *str, uint8_t out[6])
@@ -58,7 +138,6 @@ static void trim_newline(char *s)
     }
 }
 
-// Splits "KEY=VALUE" in place. Returns false if no '=' found.
 static bool split_kv(char *line, char **key, char **value)
 {
     char *eq = strchr(line, '=');
@@ -80,11 +159,6 @@ static void apply_kv(const char *key, const char *value)
         return;
     }
 
-    if (strcmp(key, "USER_IMG") == 0) {
-        strncpy(g_sd_config.user_img_path, value, SD_CFG_PATH_MAXLEN - 1);
-        g_sd_config.user_img_path[SD_CFG_PATH_MAXLEN - 1] = '\0';
-        return;
-    }
     if (strcmp(key, "WIFI_SSID") == 0) {
         strncpy(g_sd_config.wifi_ssid, value, SD_CFG_WIFI_SSID_MAXLEN - 1);
         g_sd_config.wifi_ssid[SD_CFG_WIFI_SSID_MAXLEN - 1] = '\0';
@@ -96,14 +170,14 @@ static void apply_kv(const char *key, const char *value)
         g_sd_config.wifi_password[SD_CFG_WIFI_PASS_MAXLEN - 1] = '\0';
         return;
     }
-    // SOS1_NAME / SOS1_PHONE / SOS2_NAME / ... / SOS3_PHONE
+
     if (strncmp(key, "SOS", 3) == 0 && strlen(key) >= 5) {
-        int idx = key[3] - '1';   // SOS1 -> 0, SOS2 -> 1, SOS3 -> 2
+        int idx = key[3] - '1';
         if (idx < 0 || idx >= SD_CFG_MAX_CONTACTS) {
             ESP_LOGW(TAG, "Unknown contact key: %s", key);
             return;
         }
-        const char *field = key + 4; // skip "SOSn"
+        const char *field = key + 4;
         if (strcmp(field, "_NAME") == 0) {
             strncpy(g_sd_config.contacts[idx].name, value, SD_CFG_NAME_MAXLEN - 1);
             g_sd_config.contacts[idx].name[SD_CFG_NAME_MAXLEN - 1] = '\0';
@@ -132,7 +206,7 @@ static esp_err_t parse_config_file(void)
     char line[SD_CFG_LINE_MAXLEN];
     while (fgets(line, sizeof(line), f)) {
         trim_newline(line);
-        if (line[0] == '\0' || line[0] == '#') continue; // blank line / comment
+        if (line[0] == '\0' || line[0] == '#') continue;
 
         char *key, *value;
         if (!split_kv(line, &key, &value)) {
@@ -143,54 +217,6 @@ static esp_err_t parse_config_file(void)
     }
 
     fclose(f);
-    return ESP_OK;
-}
-
-static esp_err_t load_user_image(void)
-{
-    if (g_sd_config.user_img_path[0] == '\0') {
-        ESP_LOGI(TAG, "No USER_IMG field set, skipping face image load");
-        return ESP_OK; // optional field
-    }
-
-    char full_path[SD_CFG_PATH_MAXLEN + sizeof(SD_MOUNT_POINT)];
-    snprintf(full_path, sizeof(full_path), "%s%s", SD_MOUNT_POINT, g_sd_config.user_img_path);
-
-    FILE *f = fopen(full_path, "rb");
-    if (!f) {
-        ESP_LOGE(TAG, "User image not found at %s", full_path);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    if (size <= 0) {
-        ESP_LOGE(TAG, "User image is empty or unreadable");
-        fclose(f);
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    uint8_t *buf = malloc((size_t)size);
-    if (!buf) {
-        ESP_LOGE(TAG, "malloc(%ld) failed for user image — check heap budget", size);
-        fclose(f);
-        return ESP_ERR_NO_MEM;
-    }
-
-    size_t read = fread(buf, 1, (size_t)size, f);
-    fclose(f);
-
-    if (read != (size_t)size) {
-        ESP_LOGE(TAG, "Short read on user image (%d/%ld bytes)", (int)read, size);
-        free(buf);
-        return ESP_FAIL;
-    }
-
-    g_sd_config.user_img_buf = buf;
-    g_sd_config.user_img_len = read;
-    ESP_LOGI(TAG, "User image loaded: %d bytes", (int)read);
     return ESP_OK;
 }
 
@@ -210,18 +236,7 @@ esp_err_t sd_config_load(void)
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = SD_SPI_HOST;
-    // Bus is shared with the TFT now. SDMMC_FREQ_DEFAULT (~20MHz) assumes
-    // clean, short PCB traces — breadboard jumper wires can't reliably
-    // carry that; the card mounts but reads start failing (BAD CONFIG).
-    // 1MHz is a safe, solid middle ground for jumper-wire prototyping.
     host.max_freq_khz = 1000;
-
-    // NOTE: no spi_bus_initialize() here on purpose. tft_display_init()
-    // already called spi_bus_initialize(SPI2_HOST, ...) before this runs.
-    // SD is added below as a second *device* on that same bus — calling
-    // spi_bus_initialize() again on an already-initialized host would just
-    // fail with ESP_ERR_INVALID_STATE, so we skip straight to attaching
-    // the device.
 
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
     slot_config.gpio_cs = SD_PIN_CS;
@@ -230,44 +245,48 @@ esp_err_t sd_config_load(void)
     sdmmc_card_t *card;
     esp_err_t ret = esp_vfs_fat_sdspi_mount(SD_MOUNT_POINT, &host, &slot_config, &mount_config, &card);
     if (ret != ESP_OK) {
-        if (ret == ESP_FAIL) {
-            ESP_LOGE(TAG, "Failed to mount filesystem — is card formatted FAT32?");
-        } else {
-            ESP_LOGE(TAG, "SD mount failed: %s (check wiring, is card inserted?)",
-                     esp_err_to_name(ret));
+        ESP_LOGW(TAG, "SD mount failed (%s) -- checking NVS cache fallback...", esp_err_to_name(ret));
+        
+        nvs_handle_t handle;
+        if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle) == ESP_OK) {
+            size_t cfg_len = sizeof(sd_runtime_config_t);
+            if (nvs_get_blob(handle, NVS_KEY_CONFIG, &g_sd_config, &cfg_len) == ESP_OK) {
+                nvs_close(handle);
+                ESP_LOGI(TAG, "Loaded fallback configuration from Flash NVS");
+                return ESP_OK;
+            }
+            nvs_close(handle);
         }
-        // Do NOT call spi_bus_free() here — this bus belongs to the TFT
-        // (SPI2_HOST) and must stay alive for the display to keep working.
         return ret;
     }
 
     ESP_LOGI(TAG, "SD mounted OK");
 
-    ret = parse_config_file();
-    if (ret == ESP_OK) {
-        (void)load_user_image(); // optional, failure here doesn't fail overall load
-        g_sd_config.loaded = true;
+    uint32_t current_crc = 0;
+    if (compute_file_crc32(SD_CONFIG_FILE, &current_crc) == ESP_OK) {
+        if (read_nvs_cache(current_crc)) {
+            g_sd_config.loaded = true;
+
+            esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, card);
+            ESP_LOGI(TAG, "SD unmounted (used NVS cache)");
+            return ESP_OK;
+        }
     }
 
-    // Insert-before-boot-only design: no further SD access needed after this,
-    // so unmount the filesystem/card — but do NOT free the SPI bus itself,
-    // since the TFT still owns and needs SPI2_HOST for the rest of runtime.
+    ESP_LOGI(TAG, "Cache Miss -- parsing config directly from SD card");
+    ret = parse_config_file();
+    if (ret == ESP_OK) {
+        g_sd_config.loaded = true;
+        save_nvs_cache(current_crc);
+    }
+
     esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, card);
     ESP_LOGI(TAG, "SD unmounted (boot-time read complete)");
 
     if (!g_sd_config.bt_mac_valid) {
-        ESP_LOGE(TAG, "BT_MAC missing or invalid — required field not set");
+        ESP_LOGE(TAG, "BT_MAC missing or invalid -- required field not set");
         return ESP_ERR_INVALID_STATE;
     }
 
     return ESP_OK;
-}
-
-void sd_config_free(void)
-{
-    if (g_sd_config.user_img_buf) {
-        free(g_sd_config.user_img_buf);
-        g_sd_config.user_img_buf = NULL;
-        g_sd_config.user_img_len = 0;
-    }
 }

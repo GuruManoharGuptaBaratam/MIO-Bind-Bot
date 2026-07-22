@@ -55,7 +55,6 @@ uint64_t sd_storage_get_free_bytes(void) {
 }
 
 // Find and delete the oldest .avi file in the video directory tree
-// Find and delete the oldest .avi file in the video directory tree
 static bool delete_oldest_video_file(const char *base_dir) {
     DIR *dir = opendir(base_dir);
     if (!dir) return false;
@@ -110,6 +109,7 @@ static bool delete_oldest_video_file(const char *base_dir) {
 
     return false;
 }
+
 // Enforce ring-buffer capacity policy
 static void check_and_enforce_ring_buffer(void) {
     uint64_t min_bytes = (uint64_t)MIN_FREE_SPACE_MB * 1024 * 1024;
@@ -252,7 +252,7 @@ esp_err_t sd_storage_open_video(uint32_t width, uint32_t height, uint8_t fps,
     char folder_path[128];
     char file_path[256];
 
-    // If year > 2020, SNTP or RTC time is valid
+    // If year > 2020, SNTP or RTC time is valid (WiFi sync active)
     if (timeinfo.tm_year > (2020 - 1900)) {
         snprintf(folder_path, sizeof(folder_path), "%s/%04d_%02d",
                  BASE_VIDEO_DIR, timeinfo.tm_year + 1900, timeinfo.tm_mon + 1);
@@ -263,12 +263,18 @@ esp_err_t sd_storage_open_video(uint32_t width, uint32_t height, uint8_t fps,
                  timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
     } else {
-        // Fallback structured directory if time is uncalibrated
-        static int s_seq = 0;
+        // Offline collision check: Loop until finding an unused unique sequence number
         snprintf(folder_path, sizeof(folder_path), "%s/rec", BASE_VIDEO_DIR);
         ensure_directory_exists(folder_path);
 
-        snprintf(file_path, sizeof(file_path), "%s/kiroku_%04d.avi", folder_path, s_seq++);
+        for (int seq = 0; seq < 9999; seq++) {
+            snprintf(file_path, sizeof(file_path), "%s/kiroku_%04d.avi", folder_path, seq);
+            struct stat st;
+            if (stat(file_path, &st) != 0) {
+                // File does not exist yet -> use this path
+                break;
+            }
+        }
     }
 
     s_video_file = fopen(file_path, "wb");

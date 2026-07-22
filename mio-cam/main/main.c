@@ -17,17 +17,20 @@ static const char *TAG = "mio_cam";
 
 // Kiroku Video Recording Parameters
 #define KIROKU_VIDEO_FPS      5      // 5 FPS provides smooth playback & stable SD writing
-#define KIROKU_DURATION_SEC   180    // 3 minutes (180 seconds)
-#define TOTAL_KIROKU_FRAMES   (KIROKU_VIDEO_FPS * KIROKU_DURATION_SEC) // 900 frames total
+#define KIROKU_DURATION_SEC   150    // 2.30 minutes (150 seconds)
+#define TOTAL_KIROKU_FRAMES   (KIROKU_VIDEO_FPS * KIROKU_DURATION_SEC) // 750 frames total
 
 static bool s_camera_ready = false;
 static bool s_sd_ready = false;
 
-// Dynamic container for on-demand user reference image
+// Container for on-demand user reference image
 typedef struct {
     uint8_t *buf;
     size_t len;
 } user_ref_img_t;
+
+// Static module-level handle for user reference image during kansei sweep
+static user_ref_img_t s_current_user_ref = {0};
 
 // Helper function to read reference image on-demand from SD Card
 static bool load_user_ref_image(user_ref_img_t *ref_img)
@@ -83,7 +86,7 @@ static void free_user_ref_image(user_ref_img_t *ref_img)
     }
 }
 
-static void on_kansei_angle(uint8_t angle_deg, const user_ref_img_t *ref_img)
+static void on_kansei_angle(uint8_t angle_deg)
 {
     if (!s_camera_ready) return;
 
@@ -97,7 +100,7 @@ static void on_kansei_angle(uint8_t angle_deg, const user_ref_img_t *ref_img)
 
     /*
      * TEMPORARY HTTP / VLM PLACEHOLDER:
-     * When ready, pass `fb->buf` (live frame) AND `ref_img->buf` (user image)
+     * When ready, pass `fb->buf` (live frame) AND `s_current_user_ref.buf` (user image)
      * to your multipart HTTP POST payload handler.
      */
     esp_err_t err = http_send_image_frame(fb->buf, fb->len, KANSEI_UPLOAD_URL, &status);
@@ -105,7 +108,7 @@ static void on_kansei_angle(uint8_t angle_deg, const user_ref_img_t *ref_img)
         ESP_LOGW(TAG, "kansei: upload failed at angle %d (status=%d)", angle_deg, status);
     } else {
         ESP_LOGI(TAG, "kansei: uploaded frame at angle %d (status=%d, ref_present=%s)",
-                 angle_deg, status, (ref_img && ref_img->buf) ? "YES" : "NO");
+                 angle_deg, status, (s_current_user_ref.buf) ? "YES" : "NO");
     }
 
     camera_driver_return(fb);
@@ -134,19 +137,14 @@ static void handle_kansei(const cam_trigger_packet_t *packet)
     }
 
     // 1. Read user reference image from SD Card ON-DEMAND for this job only
-    user_ref_img_t user_ref = {0};
-    load_user_ref_image(&user_ref);
+    load_user_ref_image(&s_current_user_ref);
 
     // 2. Perform initial capture and pan sweep
-    on_kansei_angle(0, &user_ref);
-    
-    // Perform pan sweep callback
-    servo_pan_sweep_cb([&user_ref](uint8_t angle) {
-        on_kansei_angle(angle, &user_ref);
-    });
+    on_kansei_angle(0);
+    servo_pan_sweep(on_kansei_angle);
 
     // 3. Immediately free reference image buffer after sweep completes
-    free_user_ref_image(&user_ref);
+    free_user_ref_image(&s_current_user_ref);
 
     wifi_client_disconnect();
     uart_protocol_send_event(CAM_EVENT_JOB_DONE, NULL, 0);
@@ -154,7 +152,7 @@ static void handle_kansei(const cam_trigger_packet_t *packet)
 
 static void handle_kiroku(const cam_trigger_packet_t *packet)
 {
-    ESP_LOGI(TAG, "kiroku job started: 3-min multi-axis recording (%d frames @ %d FPS), pitch=%.2f deg",
+    ESP_LOGI(TAG, "kiroku job started: 2.30-min multi-axis recording (%d frames @ %d FPS), pitch=%.2f deg",
              TOTAL_KIROKU_FRAMES, KIROKU_VIDEO_FPS, packet->pitch_centideg / 100.0f);
 
     if (!s_camera_ready || !s_sd_ready) {
@@ -163,7 +161,7 @@ static void handle_kiroku(const cam_trigger_packet_t *packet)
         return;
     }
 
-    char path[64];
+    char path[512];
     esp_err_t err = sd_storage_open_video(camera_driver_get_width(),
                                            camera_driver_get_height(),
                                            KIROKU_VIDEO_FPS, path, sizeof(path));
@@ -186,9 +184,9 @@ static void handle_kiroku(const cam_trigger_packet_t *packet)
     TickType_t last_wake_time = xTaskGetTickCount();
     const TickType_t frame_interval = pdMS_TO_TICKS(1000 / KIROKU_VIDEO_FPS);
 
-    int current_pan = 20;
+    float current_pan_fp = 20.0f;
     int pan_dir = 1;
-    int frames_per_pass = TOTAL_KIROKU_FRAMES / 3;
+    int frames_per_pass = TOTAL_KIROKU_FRAMES / 3; // 250 frames (50s) per elevation pass
 
     for (int frame = 0; frame < TOTAL_KIROKU_FRAMES; frame++) {
 
@@ -202,17 +200,16 @@ static void handle_kiroku(const cam_trigger_packet_t *packet)
             }
         }
 
-        if (frame % 3 == 0) {
-            current_pan += pan_dir;
-            if (current_pan >= 170) {
-                current_pan = 170;
-                pan_dir = -1;
-            } else if (current_pan <= 20) {
-                current_pan = 20;
-                pan_dir = 1;
-            }
-            servo_set_pan((uint8_t)current_pan);
+        // Updated speed: 1.5 deg step per frame (7.5 deg/sec at 5 FPS)
+        current_pan_fp += (pan_dir * 1.5f);
+        if (current_pan_fp >= 170.0f) {
+            current_pan_fp = 170.0f;
+            pan_dir = -1;
+        } else if (current_pan_fp <= 20.0f) {
+            current_pan_fp = 20.0f;
+            pan_dir = 1;
         }
+        servo_set_pan((uint8_t)current_pan_fp);
 
         camera_fb_t *fb = camera_driver_capture();
         if (fb) {

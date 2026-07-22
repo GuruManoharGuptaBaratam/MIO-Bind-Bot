@@ -1,25 +1,23 @@
 #include <stdio.h>
+#include <string.h>
 #include "esp_log.h"
 #include "esp_bt.h"
 #include "esp_bt_main.h"
 #include "nvs_flash.h"
 #include "esp_gap_bt_api.h"
 #include "hfp_manager.h"
-#include <string.h>
 #include "core_uart_receiver.h"
 #include "tft_display.h"
 #include "sd_config.h"
 #include "esp_timer.h"
-
 #include "job_dispatcher.h"
-
 
 static const char *TAG = "MIO_BT";
 
-// Default/fallback earbuds address — overwritten by SD config at boot if
+// Default/fallback earbuds address — overwritten by SD/NVS config at boot if
 // BT_MAC is present and valid. Kept as a fallback so the bot is still
 // bench-testable with SD removed.
-static  esp_bd_addr_t CMF_BUDS_ADDR = {
+static esp_bd_addr_t CMF_BUDS_ADDR = {
     0x3C,
     0xB0,
     0xED,
@@ -61,7 +59,6 @@ static void bt_gap_callback(
                 ESP_LOGI(TAG, "CMF BUDS FOUND");
 
                 esp_bt_gap_cancel_discovery();
-
                 hfp_connect(CMF_BUDS_ADDR);
             }
 
@@ -77,17 +74,15 @@ static void bt_gap_callback(
                     );
                 }
             }
-
             break;
         }
-        
-
 
         case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
             ESP_LOGI(TAG,
                      "Discovery State Changed: %d",
                      param->disc_st_chg.state);
             break;
+
         case ESP_BT_GAP_PIN_REQ_EVT: {
             ESP_LOGI(TAG, "PIN REQUEST — auto-replying with legacy PIN 0000");
             esp_bt_pin_code_t pin_code = {'0','0','0','0'};
@@ -109,18 +104,16 @@ static void bt_gap_callback(
             break;
     }
 }
+
 void app_main(void)
 {
-    ESP_ERROR_CHECK(
-        nvs_flash_init()
-    );
+    // 1. Initialize NVS Flash first (required for NVS config caching)
+    ESP_ERROR_CHECK(nvs_flash_init());
 
-    // Display must be up first — everything below this point may need to
-    // show status on screen (SD result, then BT/inference states as before).
+    // 2. Display must be up first — everything below may show status on screen
     tft_display_init();
 
-    // SD is read once, before anything else touches Bluetooth or the
-    // inference link. Insert-before-boot only — no re-read after this.
+    // 3. Read SD config (checks SHA-256 NVS cache first for instant boot)
     ESP_LOGI(TAG, "Reading SD config");
     ESP_LOGI(TAG, "SD load: START, tick=%lld", esp_timer_get_time());
     esp_err_t sd_ret = sd_config_load();
@@ -128,7 +121,7 @@ void app_main(void)
 
     if (sd_ret == ESP_OK && g_sd_config.bt_mac_valid) {
         memcpy(CMF_BUDS_ADDR, g_sd_config.bt_mac, sizeof(CMF_BUDS_ADDR));
-        ESP_LOGI(TAG, "CMF_BUDS_ADDR overridden from SD config");
+        ESP_LOGI(TAG, "CMF_BUDS_ADDR overridden from SD/NVS config");
         tft_display_on_sd_status(SD_BOOT_OK);
     } else if (sd_ret == ESP_ERR_NOT_FOUND || sd_ret == ESP_ERR_INVALID_RESPONSE
                || sd_ret == ESP_ERR_INVALID_STATE) {
@@ -138,82 +131,46 @@ void app_main(void)
         ESP_LOGW(TAG, "SD mounted but config invalid/missing BT_MAC — using fallback CMF_BUDS_ADDR");
         tft_display_on_sd_status(SD_BOOT_BAD_CONFIG);
     }
-    // tft_display_on_sd_status(SD_BOOT_NOT_FOUND); // test one
 
+    // 4. Initialize Bluetooth Stack
     ESP_LOGI(TAG, "Starting Bluetooth");
 
-    esp_bt_controller_config_t bt_cfg =
-        BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
 
-    ESP_ERROR_CHECK(
-        esp_bt_controller_init(&bt_cfg)
-    );
-
+    ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
     ESP_LOGI(TAG, "Controller initialized");
 
-    esp_err_t ret =
-        esp_bt_controller_enable(
-            ESP_BT_MODE_BTDM
-        );
+    esp_err_t ret = esp_bt_controller_enable(ESP_BT_MODE_BTDM);
+    ESP_LOGI(TAG, "Enable returned: %s", esp_err_to_name(ret));
 
-    ESP_LOGI(TAG,
-             "Enable returned: %s",
-             esp_err_to_name(ret));
-
-    if(ret != ESP_OK)
-    {
+    if (ret != ESP_OK) {
         return;
     }
 
-    ESP_ERROR_CHECK(
-        esp_bluedroid_init()
-    );
-
-    ESP_ERROR_CHECK(
-        esp_bluedroid_enable()
-    );
+    ESP_ERROR_CHECK(esp_bluedroid_init());
+    ESP_ERROR_CHECK(esp_bluedroid_enable());
 
     ESP_LOGI(TAG, "Bluetooth Ready");
-    // ble_scan_start();
 
-    ESP_ERROR_CHECK(
-        esp_bt_gap_register_callback(
-            bt_gap_callback
-        )
-    );
+    ESP_ERROR_CHECK(esp_bt_gap_register_callback(bt_gap_callback));
+    ESP_ERROR_CHECK(esp_bt_gap_set_device_name("MIO"));
+    ESP_ERROR_CHECK(esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE));
 
-    ESP_ERROR_CHECK(
-        esp_bt_gap_set_device_name(
-            "MIO"
-        )
-    );
-
-    ESP_ERROR_CHECK(
-        esp_bt_gap_set_scan_mode(
-            ESP_BT_CONNECTABLE,
-            ESP_BT_GENERAL_DISCOVERABLE
-        )
-    );
-
-    // hfp_init() must run before discovery starts, so the HFP profile is
-    // fully registered by the time a matching device triggers hfp_connect()
-    // from inside the GAP callback.
+    // 5. Initialize HFP Profile before starting discovery
     hfp_init();
 
     ESP_LOGI(TAG, "MIO Discoverable");
     ESP_ERROR_CHECK(
-    esp_bt_gap_start_discovery(
-        ESP_BT_INQ_MODE_GENERAL_INQUIRY,
-        10,
-        0
-    )
+        esp_bt_gap_start_discovery(
+            ESP_BT_INQ_MODE_GENERAL_INQUIRY,
+            10,
+            0
+        )
     );
 
     ESP_LOGI(TAG, "Started Bluetooth Scan");
 
-    // Independent peripheral from BT/HFP — order relative to hfp_init()
-    // doesn't matter. Routes every inference-engine command/event straight
-    // to the display.
+    // 6. Initialize Core UART Receiver & Job Dispatcher
     job_dispatcher_init();
     core_uart_receiver_set_callbacks(job_dispatcher_on_command, job_dispatcher_on_event);
     core_uart_receiver_init();
