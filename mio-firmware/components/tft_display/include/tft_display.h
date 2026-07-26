@@ -25,6 +25,11 @@ void tft_display_on_ie_event(core_event_t evt);
 void tft_display_on_ie_command(core_command_t cmd);
 void tft_display_on_sd_status(sd_boot_status_t status);
 
+void tft_display_on_button_confirm(core_command_t cmd);
+void tft_display_on_button_cancelled(core_command_t cmd, bool was_timeout);
+void tft_display_on_button_busy(void);
+
+
 
 #ifdef __cplusplus
 }

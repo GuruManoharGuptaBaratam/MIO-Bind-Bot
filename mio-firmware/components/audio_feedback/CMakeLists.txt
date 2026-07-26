@@ -10,4 +10,7 @@ idf_component_register(
         "idle.adpcm"      "wificonn.adpcm"  "wifidisc.adpcm"
         "scenepr.adpcm"   "scenedn.adpcm"   "recstart.adpcm"
         "recsave.adpcm"
+        "confkan.adpcm"   "confkir.adpcm"   "confiba.adpcm"
+        "cnlkan.adpcm"    "cnlkir.adpcm"    "cnliba.adpcm"
+        "cnltout.adpcm"   "btnbusy.adpcm"
 )

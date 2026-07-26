@@ -12,6 +12,7 @@
 #include "esp_timer.h"
 #include "job_dispatcher.h"
 #include "audio_feedback.h"
+#include "button_handler.h"
 
 static const char *TAG = "MIO_BT";
 
@@ -195,4 +196,6 @@ void app_main(void)
     job_dispatcher_init();
     core_uart_receiver_set_callbacks(job_dispatcher_on_command, job_dispatcher_on_event);
     core_uart_receiver_init();
+
+    button_handler_init();
 }

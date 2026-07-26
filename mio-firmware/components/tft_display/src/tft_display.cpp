@@ -53,7 +53,12 @@ typedef enum {
     TFT_STATE_CMD_DONE,              // generic "DONE" confirmation flash
     TFT_STATE_SD_OK,                 
     TFT_STATE_SD_NOT_FOUND,          
-    TFT_STATE_SD_BAD_CONFIG,         
+    TFT_STATE_SD_BAD_CONFIG,        
+    TFT_STATE_CONFIRM_KANSEI,
+    TFT_STATE_CONFIRM_KIROKU,
+    TFT_STATE_CONFIRM_IBASHO,
+    TFT_STATE_CMD_CANCELLED,
+    TFT_STATE_BTN_BUSY, 
 } tft_state_t;
 
 typedef struct {
@@ -81,6 +86,11 @@ static const tft_state_entry_t kStateTable[] = {
     { TFT_STATE_SD_OK,                 "SD: OK",           ST77_GREEN  },
     { TFT_STATE_SD_NOT_FOUND,          "SD: MISSING",      ST77_RED    },
     { TFT_STATE_SD_BAD_CONFIG,         "SD: BAD CONFIG",   ST77_ORANGE },
+    { TFT_STATE_CONFIRM_KANSEI, "KANSEI? Y/N", ST77_ORANGE },
+    { TFT_STATE_CONFIRM_KIROKU, "KIROKU? Y/N", ST77_ORANGE },
+    { TFT_STATE_CONFIRM_IBASHO, "IBASHO? Y/N", ST77_ORANGE },
+    { TFT_STATE_CMD_CANCELLED,  "CANCELLED",   ST77_RED    },
+    { TFT_STATE_BTN_BUSY,       "SYSTEM BUSY", ST77_ORANGE },
 };
 #define STATE_TABLE_LEN (sizeof(kStateTable) / sizeof(kStateTable[0]))
 
@@ -142,19 +152,38 @@ static void request_state(tft_state_t state)
 
     render_state(state);
 
+    // bool is_command_state = (state == TFT_STATE_WAKEWORD_DETECTED ||
+    //                          state == TFT_STATE_COMMAND_UNRECOGNIZED ||
+    //                          state == TFT_STATE_COMMAND_TIMEOUT ||
+    //                          state == TFT_STATE_CMD_KANSEI ||
+    //                          state == TFT_STATE_CMD_KIROKU ||
+    //                          state == TFT_STATE_CMD_IBASHO);
+
+    // bool is_notification_state = (state == TFT_STATE_BT_CONNECTED || 
+    //                               state == TFT_STATE_BT_DISCONNECTED ||
+    //                               state == TFT_STATE_SD_OK ||
+    //                               state == TFT_STATE_SD_NOT_FOUND ||
+    //                               state == TFT_STATE_SD_BAD_CONFIG ||
+    //                               state == TFT_STATE_CMD_DONE);
+
     bool is_command_state = (state == TFT_STATE_WAKEWORD_DETECTED ||
                              state == TFT_STATE_COMMAND_UNRECOGNIZED ||
                              state == TFT_STATE_COMMAND_TIMEOUT ||
                              state == TFT_STATE_CMD_KANSEI ||
                              state == TFT_STATE_CMD_KIROKU ||
-                             state == TFT_STATE_CMD_IBASHO);
+                             state == TFT_STATE_CMD_IBASHO ||
+                             state == TFT_STATE_CONFIRM_KANSEI ||
+                             state == TFT_STATE_CONFIRM_KIROKU ||
+                             state == TFT_STATE_CONFIRM_IBASHO);
 
     bool is_notification_state = (state == TFT_STATE_BT_CONNECTED || 
                                   state == TFT_STATE_BT_DISCONNECTED ||
                                   state == TFT_STATE_SD_OK ||
                                   state == TFT_STATE_SD_NOT_FOUND ||
                                   state == TFT_STATE_SD_BAD_CONFIG ||
-                                  state == TFT_STATE_CMD_DONE);
+                                  state == TFT_STATE_CMD_DONE ||
+                                  state == TFT_STATE_CMD_CANCELLED ||
+                                  state == TFT_STATE_BTN_BUSY);
 
     if (s_state_timeout_timer) {
         if (state == TFT_STATE_CMD_PROCESSING) {
@@ -311,4 +340,45 @@ void tft_display_on_command_done(sound_id_t done_sound)
     if (!s_bt_connected) return;
     request_state(TFT_STATE_CMD_DONE);
     audio_feedback_play(done_sound);
+}
+
+void tft_display_on_button_confirm(core_command_t cmd)
+{
+    if (!s_bt_connected) return;
+    switch (cmd) {
+        case CORE_CMD_KANSEI:
+            request_state(TFT_STATE_CONFIRM_KANSEI);
+            audio_feedback_play(SND_CONFIRM_KANSEI);
+            break;
+        case CORE_CMD_KIROKU:
+            request_state(TFT_STATE_CONFIRM_KIROKU);
+            audio_feedback_play(SND_CONFIRM_KIROKU);
+            break;
+        case CORE_CMD_IBASHO:
+            request_state(TFT_STATE_CONFIRM_IBASHO);
+            audio_feedback_play(SND_CONFIRM_IBASHO);
+            break;
+    }
+}
+
+void tft_display_on_button_cancelled(core_command_t cmd, bool was_timeout)
+{
+    if (!s_bt_connected) return;
+    request_state(TFT_STATE_CMD_CANCELLED);
+    if (was_timeout) {
+        audio_feedback_play(SND_CANCEL_TIMEOUT);
+        return;
+    }
+    switch (cmd) {
+        case CORE_CMD_KANSEI: audio_feedback_play(SND_CANCEL_KANSEI); break;
+        case CORE_CMD_KIROKU: audio_feedback_play(SND_CANCEL_KIROKU); break;
+        case CORE_CMD_IBASHO: audio_feedback_play(SND_CANCEL_IBASHO); break;
+    }
+}
+
+void tft_display_on_button_busy(void)
+{
+    if (!s_bt_connected) return;
+    request_state(TFT_STATE_BTN_BUSY);
+    audio_feedback_play(SND_BUTTON_BUSY);
 }

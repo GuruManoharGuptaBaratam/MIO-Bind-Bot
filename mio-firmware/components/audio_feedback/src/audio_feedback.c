@@ -53,6 +53,9 @@ DECLARE_CLIP(kansei)    DECLARE_CLIP(kiroku)    DECLARE_CLIP(ibasho)
 DECLARE_CLIP(cmdunk)    DECLARE_CLIP(cmdtout)   DECLARE_CLIP(idle)      
 DECLARE_CLIP(wificonn)  DECLARE_CLIP(wifidisc)  DECLARE_CLIP(scenepr)   
 DECLARE_CLIP(scenedn)   DECLARE_CLIP(recstart)  DECLARE_CLIP(recsave)
+DECLARE_CLIP(confkan)   DECLARE_CLIP(confkir)   DECLARE_CLIP(confiba)
+DECLARE_CLIP(cnlkan)    DECLARE_CLIP(cnlkir)    DECLARE_CLIP(cnliba)
+DECLARE_CLIP(cnltout)   DECLARE_CLIP(btnbusy)
 
 static const sound_def_t k_sounds[SND_COUNT] = {
     [SND_SD_MISSING]         = { CLIP(sdmiss),   PRIO_CRITICAL },
@@ -78,6 +81,14 @@ static const sound_def_t k_sounds[SND_COUNT] = {
     [SND_SCENE_DONE]         = { CLIP(scenedn),  PRIO_INFO },
     [SND_RECORDING_STARTED]  = { CLIP(recstart), PRIO_INFO },
     [SND_RECORDING_SAVED]    = { CLIP(recsave),  PRIO_INFO },
+    [SND_CONFIRM_KANSEI]     = { CLIP(confkan), PRIO_STATE },
+    [SND_CONFIRM_KIROKU]     = { CLIP(confkir), PRIO_STATE },
+    [SND_CONFIRM_IBASHO]     = { CLIP(confiba), PRIO_STATE },
+    [SND_CANCEL_KANSEI]      = { CLIP(cnlkan),  PRIO_STATE },
+    [SND_CANCEL_KIROKU]      = { CLIP(cnlkir),  PRIO_STATE },
+    [SND_CANCEL_IBASHO]      = { CLIP(cnliba),  PRIO_STATE },
+    [SND_CANCEL_TIMEOUT]     = { CLIP(cnltout), PRIO_STATE },
+    [SND_BUTTON_BUSY]        = { CLIP(btnbusy), PRIO_STATE },
 };
 
 // --- Standard IMA ADPCM decode tables ---
