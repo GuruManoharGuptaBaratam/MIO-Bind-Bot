@@ -12,6 +12,7 @@
 #include "i2s_tx.h" // <--- ADD THIS INCLUDE
 #include "driver/gpio.h"
 #include "tft_display.h"
+#include "audio_feedback.h"
 
 // Drives HIGH while SCO/HFP audio is actually connected.
 // Wire this to PIN_BT_STATUS on the Inference ESP32 (GPIO21 there).
@@ -138,6 +139,17 @@ static void incoming_data_callback(const uint8_t *buf, uint32_t len)
 
 static uint32_t outgoing_data_callback(uint8_t *buf, uint32_t len)
 {
+    // State-feedback clips take priority over live mic sidetone -- a
+    // "SD card missing" confirmation must be heard clearly, not mixed
+    // under whatever the user happens to be saying into the mic.
+    size_t fb_len = audio_feedback_pull_frame(buf, len);
+    if (fb_len > 0) {
+        if (fb_len < len) {
+            memset(buf + fb_len, 0, len - fb_len);
+        }
+        return len;
+    }
+
     if (s_loopback_len > 0) {
         uint32_t copy_len = len < s_loopback_len ? len : s_loopback_len;
         
@@ -221,6 +233,8 @@ static void hfp_callback(
                     gpio_set_level(PIN_BT_STATUS_OUT, 1);
                     s_sco_connected = true;
                     tft_display_on_bt_state(true);
+                    audio_feedback_set_wideband(false);
+                    audio_feedback_flush_pending();
                     break;
 
                 case ESP_HF_AUDIO_STATE_CONNECTED_MSBC:
@@ -230,6 +244,8 @@ static void hfp_callback(
                     gpio_set_level(PIN_BT_STATUS_OUT, 1);
                     s_sco_connected = true;
                     tft_display_on_bt_state(true);
+                    audio_feedback_set_wideband(true);
+                    audio_feedback_flush_pending();
                     break;
 
                 case ESP_HF_AUDIO_STATE_DISCONNECTED:
@@ -316,6 +332,9 @@ void hfp_init(void)
     // === INTEGRATION POINT ===
     // Spin up the physical I2S peripheral hardware master configuration
     init_i2s_master_tx();
+    // NOTE: audio_feedback_init() is called from app_main() in main.c,
+    // BEFORE this function runs -- it must exist prior to the SD status
+    // check (main.c step 3), which is earlier than hfp_init() (step 5).
 
     s_audio_rb = xRingbufferCreate(AUDIO_RB_SIZE_BYTES, RINGBUF_TYPE_BYTEBUF);
     if (!s_audio_rb) {

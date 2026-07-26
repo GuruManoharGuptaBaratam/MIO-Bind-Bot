@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "audio_feedback.h"
 
 static const char *TAG = "TFT_DISPLAY";
 
@@ -25,6 +26,11 @@ static SemaphoreHandle_t s_gfx_mutex = nullptr;
 
 #define NOTIFY_TIMEOUT_MS          2000  
 #define COMMAND_HOLD_TIMEOUT_MS    3000  
+#define PROCESSING_SAFETY_TIMEOUT_MS 15000  // fallback only -- if _done()
+                                             // never arrives (dropped WiFi,
+                                             // MacBook crash, etc.), don't
+                                             // strand the UI/audio on
+                                             // "WORKING..." forever
 static esp_timer_handle_t s_state_timeout_timer = nullptr;
 
 typedef enum {
@@ -41,6 +47,10 @@ typedef enum {
     TFT_STATE_CMD_KANSEI,            
     TFT_STATE_CMD_KIROKU,            
     TFT_STATE_CMD_IBASHO,            
+    TFT_STATE_CMD_PROCESSING,        // generic "WORKING..." -- no fixed
+                                      // timeout; holds until _done() or
+                                      // the safety timeout fires
+    TFT_STATE_CMD_DONE,              // generic "DONE" confirmation flash
     TFT_STATE_SD_OK,                 
     TFT_STATE_SD_NOT_FOUND,          
     TFT_STATE_SD_BAD_CONFIG,         
@@ -66,6 +76,8 @@ static const tft_state_entry_t kStateTable[] = {
     { TFT_STATE_CMD_KANSEI,            "CMD: KANSEI",      ST77_GREEN  },
     { TFT_STATE_CMD_KIROKU,            "CMD: KIROKU",      ST77_GREEN  },
     { TFT_STATE_CMD_IBASHO,            "CMD: IBASHO",      ST77_GREEN  },
+    { TFT_STATE_CMD_PROCESSING,        "WORKING...",       ST77_CYAN   },
+    { TFT_STATE_CMD_DONE,              "DONE",             ST77_GREEN  },
     { TFT_STATE_SD_OK,                 "SD: OK",           ST77_GREEN  },
     { TFT_STATE_SD_NOT_FOUND,          "SD: MISSING",      ST77_RED    },
     { TFT_STATE_SD_BAD_CONFIG,         "SD: BAD CONFIG",   ST77_ORANGE },
@@ -141,10 +153,15 @@ static void request_state(tft_state_t state)
                                   state == TFT_STATE_BT_DISCONNECTED ||
                                   state == TFT_STATE_SD_OK ||
                                   state == TFT_STATE_SD_NOT_FOUND ||
-                                  state == TFT_STATE_SD_BAD_CONFIG);
+                                  state == TFT_STATE_SD_BAD_CONFIG ||
+                                  state == TFT_STATE_CMD_DONE);
 
     if (s_state_timeout_timer) {
-        if (is_command_state) {
+        if (state == TFT_STATE_CMD_PROCESSING) {
+            // Long fallback only -- normal path out of this state is an
+            // explicit tft_display_on_command_done() call, not a timer.
+            esp_timer_start_once(s_state_timeout_timer, PROCESSING_SAFETY_TIMEOUT_MS * 1000);
+        } else if (is_command_state) {
             esp_timer_start_once(s_state_timeout_timer, COMMAND_HOLD_TIMEOUT_MS * 1000);
         } else if (is_notification_state) {
             esp_timer_start_once(s_state_timeout_timer, NOTIFY_TIMEOUT_MS * 1000);
@@ -195,10 +212,26 @@ void tft_display_on_bt_state(bool connected)
 
 void tft_display_on_sd_status(sd_boot_status_t status)
 {
+    // Audio here is DEFERRED, not played immediately: this runs seconds
+    // before SCO ever connects. Playing immediately means the ring buffer
+    // fills before anything drains it, most of the clip gets dropped by
+    // send-timeouts, and what little survives plays stale/truncated the
+    // instant SCO finally connects (confirmed via device log). Deferring
+    // means audio_feedback_flush_pending() -- called from hfp_manager.c
+    // once SCO is actually up -- plays it fresh and in full.
     switch (status) {
-        case SD_BOOT_OK:         request_state(TFT_STATE_SD_OK);         break;
-        case SD_BOOT_NOT_FOUND:  request_state(TFT_STATE_SD_NOT_FOUND);  break;
-        case SD_BOOT_BAD_CONFIG: request_state(TFT_STATE_SD_BAD_CONFIG); break;
+        case SD_BOOT_OK:
+            request_state(TFT_STATE_SD_OK);
+            audio_feedback_defer_until_connected(SND_SD_OK);
+            break;
+        case SD_BOOT_NOT_FOUND:
+            request_state(TFT_STATE_SD_NOT_FOUND);
+            audio_feedback_defer_until_connected(SND_SD_MISSING);
+            break;
+        case SD_BOOT_BAD_CONFIG:
+            request_state(TFT_STATE_SD_BAD_CONFIG);
+            audio_feedback_defer_until_connected(SND_SD_BAD_CONFIG);
+            break;
     }
 }
 
@@ -206,14 +239,35 @@ void tft_display_on_ie_event(core_event_t evt)
 {
     if (!s_bt_connected) return;
     switch (evt) {
-        case CORE_EVT_LISTENING_WAKEWORD:                                           break; 
-        case CORE_EVT_WAKEWORD_DETECTED:    request_state(TFT_STATE_WAKEWORD_DETECTED);    break;
-        case CORE_EVT_COUNTDOWN_3:          request_state(TFT_STATE_COUNTDOWN_3);          break;
-        case CORE_EVT_COUNTDOWN_2:          request_state(TFT_STATE_COUNTDOWN_2);          break;
-        case CORE_EVT_COUNTDOWN_1:          request_state(TFT_STATE_COUNTDOWN_1);          break;
-        case CORE_EVT_LISTENING_COMMAND:    request_state(TFT_STATE_LISTENING_COMMAND);    break;
-        case CORE_EVT_COMMAND_UNRECOGNIZED: request_state(TFT_STATE_COMMAND_UNRECOGNIZED); break;
-        case CORE_EVT_COMMAND_TIMEOUT:      request_state(TFT_STATE_COMMAND_TIMEOUT);      break;
+        case CORE_EVT_LISTENING_WAKEWORD:
+            break;
+        case CORE_EVT_WAKEWORD_DETECTED:
+            request_state(TFT_STATE_WAKEWORD_DETECTED);
+            audio_feedback_play(SND_WAKEWORD_OK);
+            break;
+        case CORE_EVT_COUNTDOWN_3:
+            request_state(TFT_STATE_COUNTDOWN_3);
+            audio_feedback_play(SND_COUNTDOWN_3);
+            break;
+        case CORE_EVT_COUNTDOWN_2:
+            request_state(TFT_STATE_COUNTDOWN_2);
+            audio_feedback_play(SND_COUNTDOWN_2);
+            break;
+        case CORE_EVT_COUNTDOWN_1:
+            request_state(TFT_STATE_COUNTDOWN_1);
+            audio_feedback_play(SND_COUNTDOWN_1);
+            break;
+        case CORE_EVT_LISTENING_COMMAND:
+            request_state(TFT_STATE_LISTENING_COMMAND);
+            break;
+        case CORE_EVT_COMMAND_UNRECOGNIZED:
+            request_state(TFT_STATE_COMMAND_UNRECOGNIZED);
+            audio_feedback_play(SND_CMD_UNKNOWN);
+            break;
+        case CORE_EVT_COMMAND_TIMEOUT:
+            request_state(TFT_STATE_COMMAND_TIMEOUT);
+            audio_feedback_play(SND_COMMAND_TIMEOUT);
+            break;
     }
 }
 
@@ -221,8 +275,40 @@ void tft_display_on_ie_command(core_command_t cmd)
 {
     if (!s_bt_connected) return;
     switch (cmd) {
-        case CORE_CMD_KANSEI: request_state(TFT_STATE_CMD_KANSEI); break;
-        case CORE_CMD_KIROKU: request_state(TFT_STATE_CMD_KIROKU); break;
-        case CORE_CMD_IBASHO: request_state(TFT_STATE_CMD_IBASHO); break;
+        case CORE_CMD_KANSEI:
+            request_state(TFT_STATE_CMD_KANSEI);
+            audio_feedback_play(SND_CMD_KANSEI);
+            break;
+        case CORE_CMD_KIROKU:
+            request_state(TFT_STATE_CMD_KIROKU);
+            audio_feedback_play(SND_CMD_KIROKU);
+            break;
+        case CORE_CMD_IBASHO:
+            request_state(TFT_STATE_CMD_IBASHO);
+            audio_feedback_play(SND_CMD_IBASHO);
+            break;
     }
+}
+
+// Call once the actual work for a command has started (VLM request sent,
+// recording opened, etc.) -- distinct from tft_display_on_ie_command()
+// above, which just confirms the command word was recognized. This state
+// has no fixed timeout; it holds until tft_display_on_command_done() or
+// the safety timeout fires. `working_sound` lets the caller pass the
+// command-specific clip (e.g. SND_SCENE_PROCESSING for kansei,
+// SND_RECORDING_STARTED for kiroku) while the visual stays generic.
+void tft_display_on_command_processing(sound_id_t working_sound)
+{
+    if (!s_bt_connected) return;
+    request_state(TFT_STATE_CMD_PROCESSING);
+    audio_feedback_play(working_sound);
+}
+
+// Call once the work actually completes. `done_sound` is the
+// command-specific completion clip (e.g. SND_SCENE_DONE, SND_RECORDING_SAVED).
+void tft_display_on_command_done(sound_id_t done_sound)
+{
+    if (!s_bt_connected) return;
+    request_state(TFT_STATE_CMD_DONE);
+    audio_feedback_play(done_sound);
 }

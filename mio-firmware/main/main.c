@@ -11,6 +11,7 @@
 #include "sd_config.h"
 #include "esp_timer.h"
 #include "job_dispatcher.h"
+#include "audio_feedback.h"
 
 static const char *TAG = "MIO_BT";
 
@@ -113,22 +114,42 @@ void app_main(void)
     // 2. Display must be up first — everything below may show status on screen
     tft_display_init();
 
-    // 3. Read SD config (checks SHA-256 NVS cache first for instant boot)
+    // 2b. audio_feedback must exist before the SD status check below, since
+    // that's the first thing in boot that triggers a feedback sound.
+    if (!audio_feedback_init()) {
+        ESP_LOGE(TAG, "audio_feedback_init failed -- state feedback disabled");
+    }
+
+    // 3. Read SD config
     ESP_LOGI(TAG, "Reading SD config");
     ESP_LOGI(TAG, "SD load: START, tick=%lld", esp_timer_get_time());
     esp_err_t sd_ret = sd_config_load();
     ESP_LOGI(TAG, "SD load: END, tick=%lld, ret=%s", esp_timer_get_time(), esp_err_to_name(sd_ret));
 
-    if (sd_ret == ESP_OK && g_sd_config.bt_mac_valid) {
-        memcpy(CMF_BUDS_ADDR, g_sd_config.bt_mac, sizeof(CMF_BUDS_ADDR));
-        ESP_LOGI(TAG, "CMF_BUDS_ADDR overridden from SD/NVS config");
+    if (sd_ret == ESP_OK) {
+        // Physical SD card mounted and config loaded successfully
+        if (g_sd_config.bt_mac_valid) {
+            memcpy(CMF_BUDS_ADDR, g_sd_config.bt_mac, sizeof(CMF_BUDS_ADDR));
+            ESP_LOGI(TAG, "CMF_BUDS_ADDR overridden from SD config");
+        }
         tft_display_on_sd_status(SD_BOOT_OK);
-    } else if (sd_ret == ESP_ERR_NOT_FOUND || sd_ret == ESP_ERR_INVALID_RESPONSE
-               || sd_ret == ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "SD card not detected/mountable — using fallback CMF_BUDS_ADDR");
+    } 
+    else if (sd_ret == ESP_ERR_NOT_FOUND) {
+        // Physical SD card missing or mount failed
+        if (g_sd_config.bt_mac_valid) {
+            memcpy(CMF_BUDS_ADDR, g_sd_config.bt_mac, sizeof(CMF_BUDS_ADDR));
+            ESP_LOGI(TAG, "SD missing: using cached NVS CMF_BUDS_ADDR");
+        } else {
+            ESP_LOGW(TAG, "SD card missing and no NVS cache available — using default address");
+        }
         tft_display_on_sd_status(SD_BOOT_NOT_FOUND);
-    } else {
-        ESP_LOGW(TAG, "SD mounted but config invalid/missing BT_MAC — using fallback CMF_BUDS_ADDR");
+    } 
+    else {
+        // SD card mounted, but config is invalid or missing required BT_MAC
+        if (g_sd_config.bt_mac_valid) {
+            memcpy(CMF_BUDS_ADDR, g_sd_config.bt_mac, sizeof(CMF_BUDS_ADDR));
+        }
+        ESP_LOGW(TAG, "SD mounted but config invalid or missing BT_MAC");
         tft_display_on_sd_status(SD_BOOT_BAD_CONFIG);
     }
 
