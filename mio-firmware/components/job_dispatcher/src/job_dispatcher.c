@@ -27,6 +27,9 @@ static void clear_busy_state(void)
 static void on_job_timeout_callback(TimerHandle_t xTimer)
 {
     ESP_LOGW(TAG, "Job timeout reached -- forcefully unlocking system busy state");
+    
+    // Notify display module to halt periodic reminder timer & reset state
+    tft_display_on_job_timeout();
     clear_busy_state();
 }
 
@@ -96,8 +99,14 @@ void job_dispatcher_on_command(core_command_t cmd)
 
     if (cmd == CORE_CMD_KANSEI) {
         s_current_cmd = cmd;
+
+        // 1. Show "CMD: KANSEI" on display & play command detection audio
+        tft_display_on_ie_command(cmd);
+
+        // 2. Hold for 1.5s to allow user to see/hear command detection
+        vTaskDelay(pdMS_TO_TICKS(1500));
         
-        // Starts "sweeping..." display state & initiates 2s repeating audio reminder
+        // 3. Starts "SWEEPING..." display state & initiates periodic reminder loop
         tft_display_on_command_processing(SND_SCENE_PROCESSING);
         set_busy_state_with_timeout(60000); // 60s timeout window
 
@@ -109,8 +118,14 @@ void job_dispatcher_on_command(core_command_t cmd)
 
     } else if (cmd == CORE_CMD_KIROKU) {
         s_current_cmd = cmd;
+
+        // 1. Show "CMD: KIROKU" on display & play command detection audio
+        tft_display_on_ie_command(cmd);
+
+        // 2. Hold for 1.5s to allow user to see/hear command detection
+        vTaskDelay(pdMS_TO_TICKS(1500));
         
-        // Starts "recording..." display state & initiates 2s repeating audio reminder
+        // 3. Starts "RECORDING..." display state & initiates periodic reminder loop
         tft_display_on_command_processing(SND_RECORDING_STARTED);
         set_busy_state_with_timeout(180000); // 180s timeout window
 

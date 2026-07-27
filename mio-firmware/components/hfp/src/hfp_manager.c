@@ -9,7 +9,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/ringbuf.h"
-#include "i2s_tx.h" // <--- ADD THIS INCLUDE
+#include "i2s_tx.h"
 #include "driver/gpio.h"
 #include "tft_display.h"
 #include "audio_feedback.h"
@@ -19,10 +19,6 @@
 #define PIN_BT_STATUS_OUT   GPIO_NUM_23
 
 // --- Smoothing ring buffer between HFP callback and I2S ---
-// mSBC delivers PCM in small bursts at a fixed cadence; the I2S master
-// clock runs continuously and independently. Without this buffer, any
-// scheduling jitter on the BT side leaves I2S with nothing to send and
-// it transmits silence, corrupting the inference window on the other chip.
 #define AUDIO_RB_SIZE_BYTES   4096     // ~128ms of smoothing at 16kHz/16-bit mono
 #define I2S_FEED_CHUNK_BYTES  128      // ~4ms per feed iteration, low latency
 static RingbufHandle_t s_audio_rb = NULL;
@@ -32,26 +28,23 @@ static volatile bool s_sco_connected = false;
 static uint8_t s_loopback_buf[120] = {0};
 static uint32_t s_loopback_len = 0;
 
-// NOTE: speed-change / time-stretch logic has been intentionally removed
-// from this file. hfp_manager now only forwards direct, unmodified audio
-// from the earbuds to the Inference ESP32 over I2S. Speed-change is
-// implemented separately, per-model, inside inference_engine.cpp:
-//   - Wakeword model: continuous streaming stretch (same logic that used
-//     to live here) applied right before filling the wakeword ring buffer.
-//   - Command model: one-shot 1.0s capture -> 1.5s stretch (ported from
-//     audio_speech_change_hfp_manager_.c) applied right before filling the
-//     command capture buffer.
-
 static const char *TAG = "MIO_HFP";
 
 static esp_bd_addr_t g_remote_bda = {0};
 static bool g_audio_started = false;
 
-// Set by hfp_connect() as soon as it's called from app_main — but the
-// actual esp_hf_ag_slc_connect() only fires once ESP_HF_PROF_STATE_EVT
-// confirms the profile is truly ready (see hfp_callback below). Calling
-// slc_connect() immediately after hfp_init() races ahead of Bluedroid's
-// async internal SDP/RFCOMM setup and silently does nothing.
+// Dynamic Codec & Sample Rate tracking
+static volatile hfp_codec_type_t g_active_codec = HFP_CODEC_UNKNOWN;
+static volatile uint32_t g_negotiated_sample_rate = 16000; // Default fallback to 16kHz
+
+uint32_t hfp_get_negotiated_sample_rate(void) {
+    return g_negotiated_sample_rate;
+}
+
+hfp_codec_type_t hfp_get_active_codec(void) {
+    return g_active_codec;
+}
+
 static esp_bd_addr_t g_pending_connect_bda = {0};
 static bool g_pending_connect = false;
 
@@ -63,17 +56,11 @@ static void mio_i2s_feeder_task(void *pvParameters)
 
     while (1) {
         if (!s_sco_connected) {
-            // No active SCO session — don't touch the BT stack at all.
-            // Idle here instead of spinning; nothing useful to feed yet.
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
 
         size_t item_size = 0;
-        // Pull whatever is available, up to one chunk, waiting briefly for
-        // fresh data. This does NOT block indefinitely: on timeout we still
-        // feed silence below so the I2S clock never stalls or free-runs on
-        // stale DMA content.
         uint8_t *data = (uint8_t *)xRingbufferReceiveUpTo(
             s_audio_rb, &item_size, pdMS_TO_TICKS(4), I2S_FEED_CHUNK_BYTES);
 
@@ -81,23 +68,14 @@ static void mio_i2s_feeder_task(void *pvParameters)
             memcpy(feed_buf, data, item_size);
             vRingbufferReturnItem(s_audio_rb, data);
 
-            // Pad any shortfall with silence rather than leaving garbage
             if (item_size < I2S_FEED_CHUNK_BYTES) {
                 memset(feed_buf + item_size, 0, I2S_FEED_CHUNK_BYTES - item_size);
             }
         } else {
-            // Genuine underrun (BT hasn't delivered anything in time) —
-            // feed explicit silence so the I2S clock keeps a clean, known
-            // cadence instead of repeating stale DMA content.
             memset(feed_buf, 0, I2S_FEED_CHUNK_BYTES);
         }
 
         stream_audio_over_i2s(feed_buf, I2S_FEED_CHUNK_BYTES);
-        // NOTE: esp_hf_ag_outgoing_data_ready() intentionally NOT called here.
-        // It's called from incoming_data_callback() instead, once per real
-        // SCO packet arrival, which is the actual air-interface cadence.
-        // Calling it from this loop (paced by I2S writes, not BT timing)
-        // floods the transmit queue — see SCO xmit Q overflow.
     }
 }
 
@@ -112,36 +90,35 @@ static void incoming_data_callback(const uint8_t *buf, uint32_t len)
     memcpy(s_loopback_buf, buf, loop_len);
     s_loopback_len = loop_len;
 
-    // Debug: first 10 bytes, to visually confirm bytes change with voice
-    // if (len >= 10) {
-    //     ESP_LOGI(TAG, "★ AUDIO ★ %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-    //         buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9]);
-    // }
+    // Resample 8 kHz CVSD -> 16 kHz on ingress via 2x linear interpolation
+    if (g_negotiated_sample_rate == 8000) {
+        const int16_t *pcm_in = (const int16_t *)buf;
+        size_t sample_count = len / sizeof(int16_t);
+        int16_t resampled_buf[sample_count * 2];
 
-    // Non-blocking push of the DIRECT, unmodified audio into the smoothing
-    // ring buffer. If it's full (feeder task falling behind), drop this
-    // packet rather than block the BT callback context. No speed-change is
-    // applied here — hfp_manager only forwards raw audio; per-model speed
-    // change now happens downstream in inference_engine.cpp.
-    if (xRingbufferSend(s_audio_rb, buf, len, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "Audio ring buffer full — dropped %lu bytes", (unsigned long)len);
+        for (size_t i = 0; i < sample_count; i++) {
+            int16_t current = pcm_in[i];
+            int16_t next = (i + 1 < sample_count) ? pcm_in[i + 1] : current;
+
+            resampled_buf[i * 2]     = current;
+            resampled_buf[i * 2 + 1] = (int16_t)(((int32_t)current + (int32_t)next) / 2);
+        }
+
+        if (xRingbufferSend(s_audio_rb, resampled_buf, sizeof(resampled_buf), 0) != pdTRUE) {
+            ESP_LOGW(TAG, "Audio ring buffer full — dropped %zu bytes (resampled)", sizeof(resampled_buf));
+        }
+    } else {
+        // Direct pass-through for 16 kHz mSBC
+        if (xRingbufferSend(s_audio_rb, buf, len, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "Audio ring buffer full — dropped %lu bytes", (unsigned long)len);
+        }
     }
 
-    // This must be paced by the real SCO air-interface cadence, not by our
-    // own I2S write loop. Each incoming packet arrival IS that real cadence
-    // (fixed by the BT radio, ~7.5ms slots), so signal "ready for more
-    // outgoing data" exactly once per real incoming packet here — calling
-    // it from the feeder loop instead floods the transmit queue
-    // (SCO xmit Q overflow) since that loop isn't synchronized to the
-    // actual over-the-air timing.
     esp_hf_ag_outgoing_data_ready();
 }
 
 static uint32_t outgoing_data_callback(uint8_t *buf, uint32_t len)
 {
-    // State-feedback clips take priority over live mic sidetone -- a
-    // "SD card missing" confirmation must be heard clearly, not mixed
-    // under whatever the user happens to be saying into the mic.
     size_t fb_len = audio_feedback_pull_frame(buf, len);
     if (fb_len > 0) {
         if (fb_len < len) {
@@ -153,14 +130,12 @@ static uint32_t outgoing_data_callback(uint8_t *buf, uint32_t len)
     if (s_loopback_len > 0) {
         uint32_t copy_len = len < s_loopback_len ? len : s_loopback_len;
         
-        // Apply gain to boost volume
         int16_t *samples = (int16_t *)s_loopback_buf;
         int16_t *out = (int16_t *)buf;
         uint32_t num_samples = copy_len / 2;
         
         for (uint32_t i = 0; i < num_samples; i++) {
-            int32_t amplified = (int32_t)samples[i] * 3; // increase 3 for more volume
-            // Clamp to prevent overflow
+            int32_t amplified = (int32_t)samples[i] * 3;
             if (amplified > 32767) amplified = 32767;
             if (amplified < -32768) amplified = -32768;
             out[i] = (int16_t)amplified;
@@ -183,9 +158,6 @@ static void hfp_callback(
     {
         case ESP_HF_PROF_STATE_EVT:
             ESP_LOGI(TAG, "HFP Profile State Event — profile ready");
-            // This event only fires once, when esp_hf_ag_init() completes
-            // (we never call esp_hf_ag_deinit()), so no need to inspect
-            // param fields — its mere arrival means the profile is ready.
             if (g_pending_connect) {
                 ESP_LOGI(TAG, "Connecting to pending target now");
                 g_pending_connect = false;
@@ -211,7 +183,6 @@ static void hfp_callback(
             {
                 ESP_LOGW(TAG, "SLC DISCONNECTED — re-enabling connectable/discoverable so CMF Buds can auto-reconnect");
                 
-                // Re-enable visibility scan modes so the earbuds can find and auto-reconnect to us in the background
                 esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
                 
                 memset(g_remote_bda, 0, ESP_BD_ADDR_LEN);
@@ -227,7 +198,9 @@ static void hfp_callback(
                     break;
 
                 case ESP_HF_AUDIO_STATE_CONNECTED:
-                    ESP_LOGI(TAG, "SCO: CONNECTED CVSD");
+                    g_active_codec = HFP_CODEC_CVSD;
+                    g_negotiated_sample_rate = 8000;
+                    ESP_LOGI(TAG, "SCO: CONNECTED CVSD (8 kHz dynamically set)");
                     esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
                     esp_bt_sleep_disable();
                     gpio_set_level(PIN_BT_STATUS_OUT, 1);
@@ -238,7 +211,9 @@ static void hfp_callback(
                     break;
 
                 case ESP_HF_AUDIO_STATE_CONNECTED_MSBC:
-                    ESP_LOGI(TAG, "SCO: CONNECTED mSBC");
+                    g_active_codec = HFP_CODEC_MSBC;
+                    g_negotiated_sample_rate = 16000;
+                    ESP_LOGI(TAG, "SCO: CONNECTED mSBC (16 kHz dynamically set)");
                     esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
                     esp_bt_sleep_disable();
                     gpio_set_level(PIN_BT_STATUS_OUT, 1);
@@ -306,6 +281,13 @@ static void hfp_callback(
 
         case ESP_HF_BCS_RESPONSE_EVT:
             ESP_LOGI(TAG, "BCS RECEIVED mode=%d (Handled)", param->bcs_rep.mode);
+            if (param->bcs_rep.mode == ESP_HF_WBS_NO) {
+                g_active_codec = HFP_CODEC_CVSD;
+                g_negotiated_sample_rate = 8000;
+            } else if (param->bcs_rep.mode == ESP_HF_WBS_YES) {
+                g_active_codec = HFP_CODEC_MSBC;
+                g_negotiated_sample_rate = 16000;
+            }
             break;
 
         default:
@@ -329,12 +311,7 @@ void hfp_init(void)
     ESP_ERROR_CHECK(gpio_config(&bt_status_out_cfg));
     gpio_set_level(PIN_BT_STATUS_OUT, 0);
 
-    // === INTEGRATION POINT ===
-    // Spin up the physical I2S peripheral hardware master configuration
     init_i2s_master_tx();
-    // NOTE: audio_feedback_init() is called from app_main() in main.c,
-    // BEFORE this function runs -- it must exist prior to the SD status
-    // check (main.c step 3), which is earlier than hfp_init() (step 5).
 
     s_audio_rb = xRingbufferCreate(AUDIO_RB_SIZE_BYTES, RINGBUF_TYPE_BYTEBUF);
     if (!s_audio_rb) {
@@ -362,11 +339,5 @@ void hfp_connect(esp_bd_addr_t remote_bda)
     g_pending_connect = true;
     ESP_LOGI(TAG, "hfp_connect() called — will connect once HFP profile confirms ready");
 
-    // If the profile already turned on before this call (e.g. hfp_connect()
-    // called well after hfp_init(), like the discovery-based flow), don't
-    // wait for another ESP_HF_PROF_STATE_EVT that may never fire again —
-    // connect right away in that case.
-    // (Safe no-op if the profile isn't ready yet — ESP_HF_PROF_STATE_EVT
-    // above will handle it when it does turn on.)
     esp_hf_ag_slc_connect(remote_bda);
 }
