@@ -1,5 +1,4 @@
 #include <string.h>
-
 #include "wifi_client.h"
 
 #include "esp_event.h"
@@ -13,10 +12,6 @@
 
 static const char *TAG = "wifi_client";
 
-/* How many times to retry associating before wifi_client_connect() gives
- * up and returns an error. Kept finite on purpose -- an infinite retry
- * loop here is exactly the kind of thing that can starve other tasks
- * and trip the watchdog if it happens on a busy core. */
 #define WIFI_CONNECT_MAX_RETRIES 5
 
 #define WIFI_CONNECTED_BIT BIT0
@@ -27,16 +22,6 @@ static esp_netif_t *s_netif = NULL;
 static int s_retry_count = 0;
 static bool s_initialized = false;
 static bool s_connected = false;
-
-/* Set right before a deliberate wifi_client_disconnect() call, so the
- * event handler can tell "disconnect I asked for" apart from "the
- * connection dropped unexpectedly". Without this, esp_wifi_disconnect()
- * generates the same WIFI_EVENT_STA_DISCONNECTED event as a real drop,
- * and the handler would immediately try to reconnect right as
- * wifi_client_disconnect() goes on to call esp_wifi_stop() -- a race
- * that happened to not crash the one time it was observed, but isn't
- * something to leave in place for repeated per-job connect/disconnect
- * cycling. */
 static bool s_disconnect_requested = false;
 
 static char s_ssid[33] = {0};
@@ -50,13 +35,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         s_connected = false;
         if (s_disconnect_requested) {
-            // Intentional disconnect -- don't auto-reconnect.
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         } else if (s_retry_count < WIFI_CONNECT_MAX_RETRIES) {
             esp_wifi_connect();
             s_retry_count++;
-            ESP_LOGW(TAG, "retrying wifi connect (%d/%d)", s_retry_count,
-                     WIFI_CONNECT_MAX_RETRIES);
+            ESP_LOGW(TAG, "retrying wifi connect (%d/%d)", s_retry_count, WIFI_CONNECT_MAX_RETRIES);
         } else {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
@@ -68,7 +51,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
-
 
 esp_err_t wifi_client_set_credentials(const char *ssid, const char *password)
 {
@@ -95,9 +77,7 @@ esp_err_t wifi_client_set_credentials(const char *ssid, const char *password)
     wifi_config_t wifi_config = {0};
     strncpy((char *) wifi_config.sta.ssid, s_ssid, sizeof(wifi_config.sta.ssid) - 1);
     strncpy((char *) wifi_config.sta.password, s_password, sizeof(wifi_config.sta.password) - 1);
-    wifi_config.sta.threshold.authmode = strlen(s_password) == 0
-                                              ? WIFI_AUTH_OPEN
-                                              : WIFI_AUTH_WPA2_PSK;
+    wifi_config.sta.threshold.authmode = strlen(s_password) == 0 ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
 
     esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
     if (err != ESP_OK) {
@@ -109,7 +89,6 @@ esp_err_t wifi_client_set_credentials(const char *ssid, const char *password)
     return ESP_OK;
 }
 
-
 esp_err_t wifi_client_init(const char *ssid, const char *password)
 {
     if (s_initialized) {
@@ -120,13 +99,6 @@ esp_err_t wifi_client_init(const char *ssid, const char *password)
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* NVS is required for the WiFi driver, and is also where PHY/RF
-     * calibration data gets stored between boots. Once a good
-     * calibration has been saved here, later boots do a lighter
-     * "partial calibration" instead of "full calibration", which is
-     * what caused the big current spike in your logs. Erasing flash
-     * wipes this out and puts you back to full calibration until the
-     * next successful connect. */
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -151,27 +123,17 @@ esp_err_t wifi_client_init(const char *ssid, const char *password)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                &wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                                &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
 
     wifi_config_t wifi_config = {0};
     strncpy((char *) wifi_config.sta.ssid, s_ssid, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char *) wifi_config.sta.password, s_password,
-            sizeof(wifi_config.sta.password) - 1);
-    wifi_config.sta.threshold.authmode = strlen(s_password) == 0
-                                              ? WIFI_AUTH_OPEN
-                                              : WIFI_AUTH_WPA2_PSK;
+    strncpy((char *) wifi_config.sta.password, s_password, sizeof(wifi_config.sta.password) - 1);
+    wifi_config.sta.threshold.authmode = strlen(s_password) == 0 ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
 
-    /* Radio is configured but NOT started yet -- esp_wifi_start() is
-     * what actually kicks off RF calibration and draws the current
-     * spike. We defer that to wifi_client_connect() so it only
-     * happens right when you need it, not automatically at boot. */
-    ESP_LOGI(TAG, "attempting SSID: '%s' (len=%d)", s_ssid, (int) strlen(s_ssid));
     s_initialized = true;
     ESP_LOGI(TAG, "wifi_client_init done (radio not started yet)");
     return ESP_OK;
@@ -197,10 +159,8 @@ esp_err_t wifi_client_connect(uint32_t timeout_ms)
         return err;
     }
 
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                            pdFALSE, pdFALSE,
-                                            pdMS_TO_TICKS(timeout_ms));
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                            pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
 
     if (bits & WIFI_CONNECTED_BIT) {
         return ESP_OK;
@@ -245,10 +205,6 @@ esp_err_t http_send_image_frame(const uint8_t *jpeg_data,
         .url = url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = 8000,
-        /* Small internal buffers are fine here -- we're sending one
-         * JPEG frame and reading a short response, not streaming.
-         * Keeping these small avoids the client grabbing more heap
-         * than it needs on a board that's already tight on RAM. */
         .buffer_size = 1024,
         .buffer_size_tx = 1024,
     };
@@ -264,8 +220,7 @@ esp_err_t http_send_image_frame(const uint8_t *jpeg_data,
     int status = -1;
     if (err == ESP_OK) {
         status = esp_http_client_get_status_code(client);
-        ESP_LOGI(TAG, "POST %s -> status %d, %lld bytes sent", url, status,
-                 (long long) jpeg_len);
+        ESP_LOGI(TAG, "POST %s -> status %d, %lld bytes sent", url, status, (long long) jpeg_len);
     } else {
         ESP_LOGE(TAG, "esp_http_client_perform failed: %s", esp_err_to_name(err));
     }
@@ -279,5 +234,88 @@ esp_err_t http_send_image_frame(const uint8_t *jpeg_data,
     if (err != ESP_OK) {
         return err;
     }
+    return (status >= 200 && status < 300) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t http_send_batch_kansei_frames(camera_fb_t **frames, size_t frame_count, 
+                                        const uint8_t *user_ref_buf, size_t user_ref_len, 
+                                        const char *url, int *status_code)
+{
+    if (!s_connected) {
+        ESP_LOGE(TAG, "not connected, call wifi_client_connect() first");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!frames || frame_count == 0 || !url) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *boundary = "----MioKanseiBoundary7MA4YWxkTrZu0gW";
+    char header_buf[256];
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 12000,
+        .buffer_size = 1024,
+        .buffer_size_tx = 1024,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE(TAG, "Failed to init http client");
+        return ESP_FAIL;
+    }
+
+    snprintf(header_buf, sizeof(header_buf), "multipart/form-data; boundary=%s", boundary);
+    esp_http_client_set_header(client, "Content-Type", header_buf);
+
+    esp_err_t err = esp_http_client_open(client, -1);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return err;
+    }
+
+    for (size_t i = 0; i < frame_count; i++) {
+        if (!frames[i]) continue;
+
+        int len = snprintf(header_buf, sizeof(header_buf),
+            "--%s\r\n"
+            "Content-Disposition: form-data; name=\"frame_%d\"; filename=\"frame_%d.jpg\"\r\n"
+            "Content-Type: image/jpeg\r\n\r\n",
+            boundary, (int)i, (int)i);
+
+        esp_http_client_write(client, header_buf, len);
+        esp_http_client_write(client, (const char *)frames[i]->buf, frames[i]->len);
+        esp_http_client_write(client, "\r\n", 2);
+    }
+
+    if (user_ref_buf && user_ref_len > 0) {
+        int len = snprintf(header_buf, sizeof(header_buf),
+            "--%s\r\n"
+            "Content-Disposition: form-data; name=\"user_ref\"; filename=\"user_ref.jpg\"\r\n"
+            "Content-Type: image/jpeg\r\n\r\n",
+            boundary);
+
+        esp_http_client_write(client, header_buf, len);
+        esp_http_client_write(client, (const char *)user_ref_buf, user_ref_len);
+        esp_http_client_write(client, "\r\n", 2);
+    }
+
+    snprintf(header_buf, sizeof(header_buf), "--%s--\r\n", boundary);
+    esp_http_client_write(client, header_buf, strlen(header_buf));
+
+    int content_len = esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    
+    if (status_code) {
+        *status_code = status;
+    }
+
+    ESP_LOGI(TAG, "Batch POST HTTP Status = %d, content_length = %d", status, content_len);
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
     return (status >= 200 && status < 300) ? ESP_OK : ESP_FAIL;
 }

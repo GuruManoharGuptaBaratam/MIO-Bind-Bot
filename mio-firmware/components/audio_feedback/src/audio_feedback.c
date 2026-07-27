@@ -9,18 +9,11 @@
 
 static const char *TAG = "audio_fb";
 
-// Clips are stored as IMA ADPCM (4:1 compressed vs raw 16-bit PCM) to fit
-// flash budget -- 19 raw-PCM clips came to ~855KB, blowing the 1500K
-// factory partition. ADPCM brings that to ~215KB. Decoded to raw PCM
-// on-the-fly here before hitting the ring buffer, so outgoing_data_callback
-// in hfp_manager.c is untouched -- it still only ever sees raw PCM.
-#define ADPCM_READ_CHUNK_BYTES  128   // compressed bytes per decode pass
-#define PCM_OUT_CHUNK_BYTES     (ADPCM_READ_CHUNK_BYTES * 4) // 2 samples/byte * 2 bytes/sample
-#define FEEDBACK_RB_BYTES       8192  // Headroom against scheduling jitter
+#define ADPCM_READ_CHUNK_BYTES  128   
+#define PCM_OUT_CHUNK_BYTES     (ADPCM_READ_CHUNK_BYTES * 4) 
+#define FEEDBACK_RB_BYTES       8192  
 #define DEBOUNCE_MS             400
 
-// --- Volume Gain Settings ---
-// 2/1 = 2.0x volume boost (+6dB gain). Adjust NUM if you need more volume.
 #define FEEDBACK_GAIN_NUM       2     
 #define FEEDBACK_GAIN_DEN       1     
 
@@ -34,12 +27,11 @@ static inline int16_t apply_gain(int16_t s) {
 typedef enum { PRIO_CRITICAL = 0, PRIO_STATE = 1, PRIO_INFO = 2 } priority_t;
 
 typedef struct {
-    const uint8_t   *fl_start;  // points at 4-byte ADPCM header, then data
+    const uint8_t   *fl_start;  
     const uint8_t   *fl_end;
     priority_t       prio;
 } sound_def_t;
 
-// --- Symbol generation macros (without sounds_ prefix) ---
 #define DECLARE_CLIP(sym) \
     extern const uint8_t _binary_##sym##_adpcm_start[]; \
     extern const uint8_t _binary_##sym##_adpcm_end[];
@@ -56,6 +48,9 @@ DECLARE_CLIP(scenedn)   DECLARE_CLIP(recstart)  DECLARE_CLIP(recsave)
 DECLARE_CLIP(confkan)   DECLARE_CLIP(confkir)   DECLARE_CLIP(confiba)
 DECLARE_CLIP(cnlkan)    DECLARE_CLIP(cnlkir)    DECLARE_CLIP(cnliba)
 DECLARE_CLIP(cnltout)   DECLARE_CLIP(btnbusy)
+
+/* Declarations for generated ADPCM files */
+DECLARE_CLIP(procbg)    DECLARE_CLIP(camerr)
 
 static const sound_def_t k_sounds[SND_COUNT] = {
     [SND_SD_MISSING]         = { CLIP(sdmiss),   PRIO_CRITICAL },
@@ -81,17 +76,17 @@ static const sound_def_t k_sounds[SND_COUNT] = {
     [SND_SCENE_DONE]         = { CLIP(scenedn),  PRIO_INFO },
     [SND_RECORDING_STARTED]  = { CLIP(recstart), PRIO_INFO },
     [SND_RECORDING_SAVED]    = { CLIP(recsave),  PRIO_INFO },
-    [SND_CONFIRM_KANSEI]     = { CLIP(confkan), PRIO_STATE },
-    [SND_CONFIRM_KIROKU]     = { CLIP(confkir), PRIO_STATE },
-    [SND_CONFIRM_IBASHO]     = { CLIP(confiba), PRIO_STATE },
-    [SND_CANCEL_KANSEI]      = { CLIP(cnlkan),  PRIO_STATE },
-    [SND_CANCEL_KIROKU]      = { CLIP(cnlkir),  PRIO_STATE },
-    [SND_CANCEL_IBASHO]      = { CLIP(cnliba),  PRIO_STATE },
-    [SND_CANCEL_TIMEOUT]     = { CLIP(cnltout), PRIO_STATE },
-    [SND_BUTTON_BUSY]        = { CLIP(btnbusy), PRIO_STATE },
+    [SND_CONFIRM_KANSEI]     = { CLIP(confkan),  PRIO_STATE },
+    [SND_CONFIRM_KIROKU]     = { CLIP(confkir),  PRIO_STATE },
+    [SND_CONFIRM_IBASHO]     = { CLIP(confiba),  PRIO_STATE },
+    [SND_CANCEL_KANSEI]      = { CLIP(cnlkan),   PRIO_STATE },
+    [SND_CANCEL_KIROKU]      = { CLIP(cnlkir),   PRIO_STATE },
+    [SND_CANCEL_IBASHO]      = { CLIP(cnliba),   PRIO_STATE },
+    [SND_CANCEL_TIMEOUT]     = { CLIP(cnltout),  PRIO_STATE },
+    [SND_BUTTON_BUSY]        = { CLIP(btnbusy),  PRIO_STATE },
+    [SND_CAM_JOB_ERROR]      = { CLIP(camerr),   PRIO_STATE },
 };
 
-// --- Standard IMA ADPCM decode tables ---
 static const int8_t k_index_table[16] = {
     -1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8
 };
@@ -126,7 +121,11 @@ static volatile bool   s_abort_current = false;
 static int64_t         s_last_played_us[SND_COUNT] = {0};
 static volatile sound_id_t s_pending_deferred = SND_COUNT;
 static volatile int64_t s_trigger_ts_us = 0;
-static volatile bool    s_wideband_active = true; // true = 16kHz (mSBC), false = 8kHz (CVSD)
+static volatile bool    s_wideband_active = true; 
+
+/* Ambient Loop Control Variables */
+static volatile bool       s_is_looping_active = false;
+static volatile sound_id_t s_current_loop_id = SND_COUNT;
 
 static void drain_ringbuf(void) {
     size_t sz;
@@ -145,13 +144,11 @@ static void play_clip(sound_id_t id) {
     ESP_LOGI(TAG, "play_clip: id=%d flash_bytes=%td", (int)id, clip_bytes);
 
     if (clip_bytes < 4) {
-        ESP_LOGE(TAG, "play_clip: id=%d has invalid/empty flash region (%td bytes)",
-                       (int)id, clip_bytes);
+        ESP_LOGE(TAG, "play_clip: id=%d has invalid/empty flash region (%td bytes)", (int)id, clip_bytes);
         s_active_id = SND_COUNT;
         return;
     }
 
-    // 4-byte header: int16 LE initial predictor, int8 initial step index, 1 pad byte
     int32_t predictor = (int16_t)(p[0] | (p[1] << 8));
     int32_t step_idx = (int8_t)p[2];
     p += 4;
@@ -170,13 +167,10 @@ static void play_clip(sound_id_t id) {
         for (size_t i = 0; i < n; i++) {
             uint8_t byte = p[i];
             
-            // Decode two 4-bit ADPCM nibbles into two 16-bit PCM samples
             int16_t s0 = adpcm_decode_nibble(byte & 0x0F, &predictor, &step_idx);
             int16_t s1 = adpcm_decode_nibble((byte >> 4) & 0x0F, &predictor, &step_idx);
 
             if (s_wideband_active) {
-                // Wideband (16 kHz / mSBC): Preserve both samples with gain.
-                // Playback speed and pitch remain 1:1 normal.
                 s0 = apply_gain(s0);
                 s1 = apply_gain(s1);
 
@@ -185,8 +179,6 @@ static void play_clip(sound_id_t id) {
                 pcm_buf[out_idx++] = (uint8_t)(s1 & 0xFF);
                 pcm_buf[out_idx++] = (uint8_t)((s1 >> 8) & 0xFF);
             } else {
-                // Narrowband (8 kHz / CVSD): Average sample pairs to decimate 2:1.
-                // Prevents fast/chipmunk playback on 8kHz Bluetooth SCO streams.
                 int16_t s_ds = apply_gain((int16_t)(((int32_t)s0 + (int32_t)s1) / 2));
 
                 pcm_buf[out_idx++] = (uint8_t)(s_ds & 0xFF);
@@ -202,8 +194,14 @@ static void play_clip(sound_id_t id) {
         }
         p += n;
     }
+
     ESP_LOGI(TAG, "play_clip: id=%d done, pushed %u PCM bytes", (int)id, (unsigned)total_pushed);
     s_active_id = SND_COUNT;
+
+    /* Seamless re-triggering if background looping is active and wasn't aborted */
+    if (s_is_looping_active && id == s_current_loop_id && !s_abort_current) {
+        xQueueSend(s_trigger_q, (void*)&s_current_loop_id, 0);
+    }
 }
 
 static void audio_feedback_task(void *arg) {
@@ -227,8 +225,7 @@ bool audio_feedback_init(void) {
         return false;
     }
 
-    xTaskCreatePinnedToCore(audio_feedback_task, "audio_fb", 4096, NULL,
-                             18, NULL, 1);
+    xTaskCreatePinnedToCore(audio_feedback_task, "audio_fb", 4096, NULL, 18, NULL, 1);
     return true;
 }
 
@@ -253,9 +250,13 @@ void audio_feedback_play(sound_id_t id) {
             ESP_LOGI(TAG, "audio_feedback_play: id=%d preempting active id=%d", (int)id, (int)s_active_id);
             s_abort_current = true;
             drain_ringbuf();
-        } else if (new_prio == PRIO_INFO) {
+        } else if (new_prio == PRIO_INFO && s_active_id != s_current_loop_id) {
             ESP_LOGI(TAG, "audio_feedback_play: id=%d dropped (INFO, busy with id=%d)", (int)id, (int)s_active_id);
             return;
+        } else if (s_active_id == s_current_loop_id) {
+            /* Stop active looping when higher priority speech arrives */
+            s_abort_current = true;
+            drain_ringbuf();
         }
     }
 
@@ -292,7 +293,7 @@ size_t audio_feedback_pull_frame(uint8_t *buf, size_t max_len) {
     size_t sz;
     void *item = xRingbufferReceiveUpTo(s_rb, &sz, 0, max_len);
     if (!item) {
-        if (s_active_id != SND_COUNT) {
+        if (s_active_id != SND_COUNT && !s_is_looping_active) {
             ESP_LOGW(TAG, "pull_frame: MID_CLIP_UNDERRUN id=%d -- producer falling behind consumer", (int)s_active_id);
         } else if (s_was_flowing) {
             ESP_LOGI(TAG, "pull_frame: feedback audio drained (BT stack now getting sidetone again)");

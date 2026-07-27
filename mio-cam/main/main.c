@@ -15,24 +15,27 @@ static const char *TAG = "mio_cam";
 #define KANSEI_UPLOAD_URL "http://192.168.1.100:8000/upload"
 #define USER_REF_IMAGE_PATH "/sdcard/user_ref.jpg"
 
+#define MAX_KANSEI_FRAMES 4
+
 // Kiroku Video Recording Parameters
-#define KIROKU_VIDEO_FPS      5      // 5 FPS provides smooth playback & stable SD writing
-#define KIROKU_DURATION_SEC   150    // 2.30 minutes (150 seconds)
-#define TOTAL_KIROKU_FRAMES   (KIROKU_VIDEO_FPS * KIROKU_DURATION_SEC) // 750 frames total
+#define KIROKU_VIDEO_FPS      5      
+#define KIROKU_DURATION_SEC   150    
+#define TOTAL_KIROKU_FRAMES   (KIROKU_VIDEO_FPS * KIROKU_DURATION_SEC) 
 
 static bool s_camera_ready = false;
 static bool s_sd_ready = false;
 
-// Container for on-demand user reference image
 typedef struct {
     uint8_t *buf;
     size_t len;
 } user_ref_img_t;
 
-// Static module-level handle for user reference image during kansei sweep
 static user_ref_img_t s_current_user_ref = {0};
 
-// Helper function to read reference image on-demand from SD Card
+// Temporary frame array held in PSRAM during fast sweep
+static camera_fb_t *s_kansei_frames[MAX_KANSEI_FRAMES] = {NULL};
+static size_t s_kansei_frame_count = 0;
+
 static bool load_user_ref_image(user_ref_img_t *ref_img)
 {
     if (!s_sd_ready || !ref_img) return false;
@@ -42,7 +45,7 @@ static bool load_user_ref_image(user_ref_img_t *ref_img)
 
     FILE *f = fopen(USER_REF_IMAGE_PATH, "rb");
     if (!f) {
-        ESP_LOGW(TAG, "kansei: user reference image (%s) not found on SD, proceeding with camera frame only", USER_REF_IMAGE_PATH);
+        ESP_LOGW(TAG, "kansei: user reference image not found, proceeding with live frames");
         return false;
     }
 
@@ -86,68 +89,84 @@ static void free_user_ref_image(user_ref_img_t *ref_img)
     }
 }
 
-static void on_kansei_angle(uint8_t angle_deg)
+// Fast capture callback (Zero Network delays during physical movement)
+static void on_kansei_angle_fast(uint8_t angle_deg)
 {
-    if (!s_camera_ready) return;
+    if (!s_camera_ready || s_kansei_frame_count >= MAX_KANSEI_FRAMES) return;
 
     camera_fb_t *fb = camera_driver_capture();
     if (!fb) {
-        ESP_LOGW(TAG, "kansei: capture failed at angle %d, skipping upload", angle_deg);
+        ESP_LOGW(TAG, "kansei: capture failed at angle %d", angle_deg);
         return;
     }
 
-    int status = 0;
+    s_kansei_frames[s_kansei_frame_count++] = fb;
+    ESP_LOGI(TAG, "kansei: captured frame %d at angle %d deg", (int)s_kansei_frame_count, angle_deg);
+}
 
-    /*
-     * TEMPORARY HTTP / VLM PLACEHOLDER:
-     * When ready, pass `fb->buf` (live frame) AND `s_current_user_ref.buf` (user image)
-     * to your multipart HTTP POST payload handler.
-     */
-    esp_err_t err = http_send_image_frame(fb->buf, fb->len, KANSEI_UPLOAD_URL, &status);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "kansei: upload failed at angle %d (status=%d)", angle_deg, status);
-    } else {
-        ESP_LOGI(TAG, "kansei: uploaded frame at angle %d (status=%d, ref_present=%s)",
-                 angle_deg, status, (s_current_user_ref.buf) ? "YES" : "NO");
+static void clear_kansei_frames(void)
+{
+    for (size_t i = 0; i < s_kansei_frame_count; i++) {
+        if (s_kansei_frames[i]) {
+            camera_driver_return(s_kansei_frames[i]);
+            s_kansei_frames[i] = NULL;
+        }
     }
-
-    camera_driver_return(fb);
+    s_kansei_frame_count = 0;
 }
 
 static void handle_kansei(const cam_trigger_packet_t *packet)
 {
     ESP_LOGI(TAG, "kansei job started, pitch=%.2f deg", packet->pitch_centideg / 100.0f);
+
+    if (!s_camera_ready) {
+        ESP_LOGE(TAG, "kansei: camera not ready, aborting");
+        uart_protocol_send_event(CAM_EVENT_JOB_FAILED, NULL, 0);
+        return;
+    }
+
+    // 1. Vertical Horizon Lock before starting horizontal panning
     servo_apply_tilt_correction(packet->pitch_centideg);
 
+    // 2. Perform fast continuous 4-frame sweep (~1.2s total physical execution time)
+    s_kansei_frame_count = 0;
+    servo_pan_sweep(on_kansei_angle_fast);
+
+    // 3. Connect to Wi-Fi after physical movement finishes (servo resting at 90 deg)
     if (packet->has_wifi_creds) {
         wifi_client_set_credentials(packet->ssid, packet->password);
     }
 
     if (wifi_client_connect(10000) != ESP_OK) {
-        ESP_LOGE(TAG, "kansei: wifi connect failed, aborting job");
+        ESP_LOGE(TAG, "kansei: wifi connect failed, aborting upload");
+        clear_kansei_frames();
         uart_protocol_send_event(CAM_EVENT_JOB_FAILED, NULL, 0);
         return;
     }
 
-    if (!s_camera_ready) {
-        ESP_LOGE(TAG, "kansei: camera not ready, aborting job");
-        wifi_client_disconnect();
-        uart_protocol_send_event(CAM_EVENT_JOB_FAILED, NULL, 0);
-        return;
-    }
-
-    // 1. Read user reference image from SD Card ON-DEMAND for this job only
+    // 4. Read user reference image on-demand from SD card
     load_user_ref_image(&s_current_user_ref);
 
-    // 2. Perform initial capture and pan sweep
-    on_kansei_angle(0);
-    servo_pan_sweep(on_kansei_angle);
+    // 5. Send all frames in 1 single HTTP multipart POST
+    int status = 0;
+    esp_err_t err = http_send_batch_kansei_frames(
+        s_kansei_frames, s_kansei_frame_count,
+        s_current_user_ref.buf, s_current_user_ref.len,
+        KANSEI_UPLOAD_URL, &status
+    );
 
-    // 3. Immediately free reference image buffer after sweep completes
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "kansei: batch upload failed (status=%d)", status);
+        uart_protocol_send_event(CAM_EVENT_JOB_FAILED, NULL, 0);
+    } else {
+        ESP_LOGI(TAG, "kansei: batch uploaded %d frames successfully", (int)s_kansei_frame_count);
+        uart_protocol_send_event(CAM_EVENT_JOB_DONE, NULL, 0);
+    }
+
+    // 6. Cleanup PSRAM buffers and drop Wi-Fi connection
     free_user_ref_image(&s_current_user_ref);
-
+    clear_kansei_frames();
     wifi_client_disconnect();
-    uart_protocol_send_event(CAM_EVENT_JOB_DONE, NULL, 0);
 }
 
 static void handle_kiroku(const cam_trigger_packet_t *packet)
@@ -186,7 +205,7 @@ static void handle_kiroku(const cam_trigger_packet_t *packet)
 
     float current_pan_fp = 20.0f;
     int pan_dir = 1;
-    int frames_per_pass = TOTAL_KIROKU_FRAMES / 3; // 250 frames (50s) per elevation pass
+    int frames_per_pass = TOTAL_KIROKU_FRAMES / 3;
 
     for (int frame = 0; frame < TOTAL_KIROKU_FRAMES; frame++) {
 
@@ -200,7 +219,6 @@ static void handle_kiroku(const cam_trigger_packet_t *packet)
             }
         }
 
-        // Updated speed: 1.5 deg step per frame (7.5 deg/sec at 5 FPS)
         current_pan_fp += (pan_dir * 1.5f);
         if (current_pan_fp >= 170.0f) {
             current_pan_fp = 170.0f;
@@ -258,16 +276,16 @@ void app_main(void)
 
     uart_protocol_init();
 
-    /* 1. MOUNT SD CARD FIRST (Before Servos touch GPIO 12 & 13) */
+    /* 1. MOUNT SD CARD FIRST */
     esp_err_t sd_err = sd_storage_init();
     s_sd_ready = (sd_err == ESP_OK);
     if (!s_sd_ready) {
-        ESP_LOGW(TAG, "SD init failed -- kiroku recording will not work this boot");
+        ESP_LOGW(TAG, "SD init failed -- kiroku recording disabled");
     }
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    /* 2. INITIALIZE SERVOS AFTER SD IS MOUNTED */
+    /* 2. INITIALIZE SERVOS */
     servo_control_init();
 
     vTaskDelay(pdMS_TO_TICKS(150)); 
@@ -276,7 +294,7 @@ void app_main(void)
     esp_err_t cam_err = camera_driver_init();
     s_camera_ready = (cam_err == ESP_OK);
     if (!s_camera_ready) {
-        ESP_LOGW(TAG, "camera init failed -- kiroku/kansei captures will not work this boot");
+        ESP_LOGW(TAG, "camera init failed");
     }
 
     wifi_client_init(WIFI_SSID, WIFI_PASSWORD);

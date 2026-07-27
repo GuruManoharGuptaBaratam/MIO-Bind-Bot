@@ -24,14 +24,16 @@ static ST7735_GFX *s_gfx = nullptr;
 static bool s_bt_connected = false;
 static SemaphoreHandle_t s_gfx_mutex = nullptr;
 
-#define NOTIFY_TIMEOUT_MS          2000  
-#define COMMAND_HOLD_TIMEOUT_MS    3000  
-#define PROCESSING_SAFETY_TIMEOUT_MS 15000  // fallback only -- if _done()
-                                             // never arrives (dropped WiFi,
-                                             // MacBook crash, etc.), don't
-                                             // strand the UI/audio on
-                                             // "WORKING..." forever
+#define NOTIFY_TIMEOUT_MS              2000  // Display "DONE" / "SAVED" / "BUSY" for 2s then back to IDLE
+#define COMMAND_HOLD_TIMEOUT_MS        3000  
+#define KANSEI_PROCESSING_TIMEOUT_MS   60000 // Failsafe timeout for KANSEI processing
+#define KIROKU_PROCESSING_TIMEOUT_MS  180000 // Failsafe timeout for KIROKU processing
+#define REMINDER_INTERVAL_MS           3000  // Repeated reminder interval set to 3s
+
 static esp_timer_handle_t s_state_timeout_timer = nullptr;
+static esp_timer_handle_t s_reminder_timer = nullptr;
+static sound_id_t s_current_processing_sound = SND_SCENE_PROCESSING;
+static bool s_is_processing_active = false; // Tracks if a background processing job is running
 
 typedef enum {
     TFT_STATE_IDLE_MIO = 0,         
@@ -47,10 +49,10 @@ typedef enum {
     TFT_STATE_CMD_KANSEI,            
     TFT_STATE_CMD_KIROKU,            
     TFT_STATE_CMD_IBASHO,            
-    TFT_STATE_CMD_PROCESSING,        // generic "WORKING..." -- no fixed
-                                      // timeout; holds until _done() or
-                                      // the safety timeout fires
-    TFT_STATE_CMD_DONE,              // generic "DONE" confirmation flash
+    TFT_STATE_KANSEI_PROCESSING,     
+    TFT_STATE_KIROKU_PROCESSING,     
+    TFT_STATE_KANSEI_DONE,           
+    TFT_STATE_KIROKU_SAVED,          
     TFT_STATE_SD_OK,                 
     TFT_STATE_SD_NOT_FOUND,          
     TFT_STATE_SD_BAD_CONFIG,        
@@ -81,21 +83,50 @@ static const tft_state_entry_t kStateTable[] = {
     { TFT_STATE_CMD_KANSEI,            "CMD: KANSEI",      ST77_GREEN  },
     { TFT_STATE_CMD_KIROKU,            "CMD: KIROKU",      ST77_GREEN  },
     { TFT_STATE_CMD_IBASHO,            "CMD: IBASHO",      ST77_GREEN  },
-    { TFT_STATE_CMD_PROCESSING,        "WORKING...",       ST77_CYAN   },
-    { TFT_STATE_CMD_DONE,              "DONE",             ST77_GREEN  },
+    { TFT_STATE_KANSEI_PROCESSING,     "SWEEPING...",      ST77_CYAN   },
+    { TFT_STATE_KIROKU_PROCESSING,     "RECORDING...",     ST77_CYAN   },
+    { TFT_STATE_KANSEI_DONE,           "KANSEI DONE",      ST77_GREEN  },
+    { TFT_STATE_KIROKU_SAVED,          "RECORD SAVED",     ST77_GREEN  },
     { TFT_STATE_SD_OK,                 "SD: OK",           ST77_GREEN  },
     { TFT_STATE_SD_NOT_FOUND,          "SD: MISSING",      ST77_RED    },
     { TFT_STATE_SD_BAD_CONFIG,         "SD: BAD CONFIG",   ST77_ORANGE },
-    { TFT_STATE_CONFIRM_KANSEI, "KANSEI? Y/N", ST77_ORANGE },
-    { TFT_STATE_CONFIRM_KIROKU, "KIROKU? Y/N", ST77_ORANGE },
-    { TFT_STATE_CONFIRM_IBASHO, "IBASHO? Y/N", ST77_ORANGE },
-    { TFT_STATE_CMD_CANCELLED,  "CANCELLED",   ST77_RED    },
-    { TFT_STATE_BTN_BUSY,       "SYSTEM BUSY", ST77_ORANGE },
+    { TFT_STATE_CONFIRM_KANSEI,        "KANSEI? Y/N",      ST77_ORANGE },
+    { TFT_STATE_CONFIRM_KIROKU,        "KIROKU? Y/N",      ST77_ORANGE },
+    { TFT_STATE_CONFIRM_IBASHO,        "IBASHO? Y/N",      ST77_ORANGE },
+    { TFT_STATE_CMD_CANCELLED,         "CANCELLED",        ST77_RED    },
+    { TFT_STATE_BTN_BUSY,              "SYSTEM BUSY",      ST77_ORANGE },
 };
 #define STATE_TABLE_LEN (sizeof(kStateTable) / sizeof(kStateTable[0]))
 
+static tft_state_t s_current_state = TFT_STATE_IDLE_MIO;
+
 static void request_state(tft_state_t state);
 static void state_timeout_callback(void *arg);
+static void reminder_timer_callback(void *arg);
+
+static void stop_reminder_timer(void)
+{
+    if (s_reminder_timer && esp_timer_is_active(s_reminder_timer)) {
+        esp_timer_stop(s_reminder_timer);
+    }
+}
+
+static void start_reminder_timer(void)
+{
+    stop_reminder_timer();
+    if (s_reminder_timer) {
+        esp_timer_start_periodic(s_reminder_timer, REMINDER_INTERVAL_MS * 1000);
+    }
+}
+
+static void reminder_timer_callback(void *arg)
+{
+    if (s_current_state == TFT_STATE_KANSEI_PROCESSING || s_current_state == TFT_STATE_KIROKU_PROCESSING) {
+        audio_feedback_play(s_current_processing_sound);
+    } else {
+        stop_reminder_timer();
+    }
+}
 
 static void render_state(tft_state_t state)
 {
@@ -112,26 +143,22 @@ static void render_state(tft_state_t state)
 
     xSemaphoreTake(s_gfx_mutex, portMAX_DELAY);
 
-    // Clear Screen completely once per state change
     s_gfx->fillRect(0, 0, TFT_WIDTH, TFT_HEIGHT, ST77_BLACK);
 
-    // Render text label centered cleanly on screen
     s_gfx->setTextColor(entry->color);
     s_gfx->setTextSize(2);
     
-    // Simple rough centering: center scale-2 text (each character is ~12 pixels wide)
     int label_len = strlen(entry->label);
     int x_pos = (TFT_WIDTH - (label_len * 12)) / 2;
-    if (x_pos < 4) x_pos = 4; // safety bound
+    if (x_pos < 4) x_pos = 4; 
 
     s_gfx->setCursor(x_pos, (TFT_HEIGHT / 2) - 8);
     s_gfx->print(entry->label);
 
-    // Failsafe sub-text for idle state
     if (state == TFT_STATE_IDLE_MIO) {
         s_gfx->setTextColor(ST77_CUSTOM_DARKGREY);
         s_gfx->setTextSize(1);
-        s_gfx->setCursor(TFT_WIDTH / 2 - 15, (TFT_HEIGHT / 2) + 16);
+        s_gfx->setCursor(TFT_WIDTH / 2 - 38, (TFT_HEIGHT / 2) + 16);
         s_gfx->print("SYSTEM ONLINE"); 
     }
 
@@ -141,7 +168,38 @@ static void render_state(tft_state_t state)
 
 static void state_timeout_callback(void *arg)
 {
+    ESP_LOGI(TAG, "State timeout reached");
+
+    bool was_command_flow_completed = (s_current_state == TFT_STATE_KANSEI_DONE ||
+                                       s_current_state == TFT_STATE_KIROKU_SAVED ||
+                                       s_current_state == TFT_STATE_CMD_IBASHO);
+
+    // If camera job hits max timeout during active processing
+    if (s_current_state == TFT_STATE_KANSEI_PROCESSING || s_current_state == TFT_STATE_KIROKU_PROCESSING) {
+        s_is_processing_active = false;
+        stop_reminder_timer();
+        audio_feedback_play(SND_CAM_JOB_ERROR);
+        request_state(TFT_STATE_IDLE_MIO);
+        return;
+    }
+
+    // Resume periodic loop if returning from a temporary interrupt (e.g., SYSTEM BUSY)
+    if (s_is_processing_active) {
+        tft_state_t target_state = (s_current_processing_sound == SND_SCENE_PROCESSING) ? 
+                                   TFT_STATE_KANSEI_PROCESSING : TFT_STATE_KIROKU_PROCESSING;
+        
+        request_state(target_state);
+        start_reminder_timer(); // Resume 3s periodic loop
+        return;
+    }
+
+    // Default transition back to IDLE
+    stop_reminder_timer();
     request_state(TFT_STATE_IDLE_MIO);
+
+    if (was_command_flow_completed) {
+        audio_feedback_play(SND_BACK_TO_IDLE);
+    }
 }
 
 static void request_state(tft_state_t state)
@@ -150,21 +208,8 @@ static void request_state(tft_state_t state)
         esp_timer_stop(s_state_timeout_timer);
     }
 
+    s_current_state = state;
     render_state(state);
-
-    // bool is_command_state = (state == TFT_STATE_WAKEWORD_DETECTED ||
-    //                          state == TFT_STATE_COMMAND_UNRECOGNIZED ||
-    //                          state == TFT_STATE_COMMAND_TIMEOUT ||
-    //                          state == TFT_STATE_CMD_KANSEI ||
-    //                          state == TFT_STATE_CMD_KIROKU ||
-    //                          state == TFT_STATE_CMD_IBASHO);
-
-    // bool is_notification_state = (state == TFT_STATE_BT_CONNECTED || 
-    //                               state == TFT_STATE_BT_DISCONNECTED ||
-    //                               state == TFT_STATE_SD_OK ||
-    //                               state == TFT_STATE_SD_NOT_FOUND ||
-    //                               state == TFT_STATE_SD_BAD_CONFIG ||
-    //                               state == TFT_STATE_CMD_DONE);
 
     bool is_command_state = (state == TFT_STATE_WAKEWORD_DETECTED ||
                              state == TFT_STATE_COMMAND_UNRECOGNIZED ||
@@ -181,15 +226,16 @@ static void request_state(tft_state_t state)
                                   state == TFT_STATE_SD_OK ||
                                   state == TFT_STATE_SD_NOT_FOUND ||
                                   state == TFT_STATE_SD_BAD_CONFIG ||
-                                  state == TFT_STATE_CMD_DONE ||
+                                  state == TFT_STATE_KANSEI_DONE ||
+                                  state == TFT_STATE_KIROKU_SAVED ||
                                   state == TFT_STATE_CMD_CANCELLED ||
                                   state == TFT_STATE_BTN_BUSY);
 
     if (s_state_timeout_timer) {
-        if (state == TFT_STATE_CMD_PROCESSING) {
-            // Long fallback only -- normal path out of this state is an
-            // explicit tft_display_on_command_done() call, not a timer.
-            esp_timer_start_once(s_state_timeout_timer, PROCESSING_SAFETY_TIMEOUT_MS * 1000);
+        if (state == TFT_STATE_KANSEI_PROCESSING) {
+            esp_timer_start_once(s_state_timeout_timer, KANSEI_PROCESSING_TIMEOUT_MS * 1000);
+        } else if (state == TFT_STATE_KIROKU_PROCESSING) {
+            esp_timer_start_once(s_state_timeout_timer, KIROKU_PROCESSING_TIMEOUT_MS * 1000);
         } else if (is_command_state) {
             esp_timer_start_once(s_state_timeout_timer, COMMAND_HOLD_TIMEOUT_MS * 1000);
         } else if (is_notification_state) {
@@ -225,6 +271,15 @@ void tft_display_init(void)
     };
     esp_timer_create(&timeout_timer_args, &s_state_timeout_timer);
 
+    const esp_timer_create_args_t reminder_timer_args = {
+        .callback = &reminder_timer_callback,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "reminder_timer",
+        .skip_unhandled_events = false
+    };
+    esp_timer_create(&reminder_timer_args, &s_reminder_timer);
+
     if (!s_gfx->begin()) {
         ESP_LOGE(TAG, "ST7735 init failed");
         return;
@@ -237,17 +292,11 @@ void tft_display_on_bt_state(bool connected)
 {
     s_bt_connected = connected;
     request_state(connected ? TFT_STATE_BT_CONNECTED : TFT_STATE_BT_DISCONNECTED);
+    audio_feedback_play(connected ? SND_WIFI_CONNECTED : SND_WIFI_DISCONNECTED);
 }
 
 void tft_display_on_sd_status(sd_boot_status_t status)
 {
-    // Audio here is DEFERRED, not played immediately: this runs seconds
-    // before SCO ever connects. Playing immediately means the ring buffer
-    // fills before anything drains it, most of the clip gets dropped by
-    // send-timeouts, and what little survives plays stale/truncated the
-    // instant SCO finally connects (confirmed via device log). Deferring
-    // means audio_feedback_flush_pending() -- called from hfp_manager.c
-    // once SCO is actually up -- plays it fresh and in full.
     switch (status) {
         case SD_BOOT_OK:
             request_state(TFT_STATE_SD_OK);
@@ -319,27 +368,72 @@ void tft_display_on_ie_command(core_command_t cmd)
     }
 }
 
-// Call once the actual work for a command has started (VLM request sent,
-// recording opened, etc.) -- distinct from tft_display_on_ie_command()
-// above, which just confirms the command word was recognized. This state
-// has no fixed timeout; it holds until tft_display_on_command_done() or
-// the safety timeout fires. `working_sound` lets the caller pass the
-// command-specific clip (e.g. SND_SCENE_PROCESSING for kansei,
-// SND_RECORDING_STARTED for kiroku) while the visual stays generic.
 void tft_display_on_command_processing(sound_id_t working_sound)
 {
     if (!s_bt_connected) return;
-    request_state(TFT_STATE_CMD_PROCESSING);
+
+    s_current_processing_sound = working_sound;
+    s_is_processing_active = true;
+
+    if (working_sound == SND_SCENE_PROCESSING) {
+        request_state(TFT_STATE_KANSEI_PROCESSING);
+    } else if (working_sound == SND_RECORDING_STARTED) {
+        request_state(TFT_STATE_KIROKU_PROCESSING);
+    }
+
+    // Play initial notification immediately
     audio_feedback_play(working_sound);
+
+    // Start repeating reminder timer (every 3 seconds)
+    start_reminder_timer();
 }
 
-// Call once the work actually completes. `done_sound` is the
-// command-specific completion clip (e.g. SND_SCENE_DONE, SND_RECORDING_SAVED).
 void tft_display_on_command_done(sound_id_t done_sound)
 {
     if (!s_bt_connected) return;
-    request_state(TFT_STATE_CMD_DONE);
+
+    // Clear processing flag and stop repeating reminder
+    s_is_processing_active = false;
+    stop_reminder_timer();
+
+    if (done_sound == SND_SCENE_DONE) {
+        request_state(TFT_STATE_KANSEI_DONE);
+    } else if (done_sound == SND_RECORDING_SAVED) {
+        request_state(TFT_STATE_KIROKU_SAVED);
+    }
+
+    // Play completion sound
     audio_feedback_play(done_sound);
+}
+
+void tft_display_on_camera_failed(void)
+{
+    ESP_LOGE(TAG, "Camera Job Failed triggered");
+    
+    // Clear processing flag and stop reminder timer
+    s_is_processing_active = false;
+    stop_reminder_timer();
+
+    // Play error prompt immediately
+    audio_feedback_play(SND_CAM_JOB_ERROR);
+
+    // Reset back to idle
+    request_state(TFT_STATE_IDLE_MIO);
+}
+
+void tft_display_on_job_timeout(void)
+{
+    ESP_LOGW(TAG, "Dispatch job timeout reached - stopping loop and resetting state");
+
+    // Clear active processing state and stop timer
+    s_is_processing_active = false;
+    stop_reminder_timer();
+
+    // Play camera job error sound
+    audio_feedback_play(SND_CAM_JOB_ERROR);
+
+    // Reset back to IDLE display state
+    request_state(TFT_STATE_IDLE_MIO);
 }
 
 void tft_display_on_button_confirm(core_command_t cmd)
@@ -379,6 +473,10 @@ void tft_display_on_button_cancelled(core_command_t cmd, bool was_timeout)
 void tft_display_on_button_busy(void)
 {
     if (!s_bt_connected) return;
+
+    // Pause periodic reminder loop during temporary interruption
+    stop_reminder_timer();
+
     request_state(TFT_STATE_BTN_BUSY);
     audio_feedback_play(SND_BUTTON_BUSY);
 }

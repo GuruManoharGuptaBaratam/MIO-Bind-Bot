@@ -12,5 +12,6 @@ idf_component_register(
         "recsave.adpcm"
         "confkan.adpcm"   "confkir.adpcm"   "confiba.adpcm"
         "cnlkan.adpcm"    "cnlkir.adpcm"    "cnliba.adpcm"
-        "cnltout.adpcm"   "btnbusy.adpcm"
+        "cnltout.adpcm"   "btnbusy.adpcm" 
+        "camerr.adpcm"
 )

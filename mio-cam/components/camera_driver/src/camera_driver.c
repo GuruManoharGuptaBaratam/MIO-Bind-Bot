@@ -25,7 +25,9 @@ static const char *TAG = "camera_driver";
 
 #define CAM_FRAME_SIZE   FRAMESIZE_CIF
 #define CAM_JPEG_QUALITY 12
-#define CAM_FB_COUNT     1
+
+// Set to 4 so all 4 swept frames can sit in PSRAM buffers without starving the DMA queue
+#define CAM_FB_COUNT     4
 #define CAM_WARMUP_FRAMES 5
 
 static bool s_initialized = false;
@@ -54,7 +56,6 @@ esp_err_t camera_driver_init(void)
         .pin_href     = CAM_PIN_HREF,
         .pin_pclk     = CAM_PIN_PCLK,
 
-        // Lower XCLK frequency to 10MHz to fix missing JPEG SOI markers on OV3660
         .xclk_freq_hz = 10000000,
         .ledc_timer   = LEDC_TIMER_1,
         .ledc_channel = LEDC_CHANNEL_2,
@@ -64,7 +65,7 @@ esp_err_t camera_driver_init(void)
         .jpeg_quality = CAM_JPEG_QUALITY,
         .fb_count     = CAM_FB_COUNT,
         .fb_location  = CAMERA_FB_IN_PSRAM,
-        .grab_mode    = CAMERA_GRAB_WHEN_EMPTY,
+        .grab_mode    = CAMERA_GRAB_LATEST,
     };
 
     esp_err_t err = esp_camera_init(&config);
@@ -73,7 +74,6 @@ esp_err_t camera_driver_init(void)
         return err;
     }
 
-    // Give the OV3660 sensor extra time to settle internal power registers
     vTaskDelay(pdMS_TO_TICKS(200));
 
     for (int i = 0; i < CAM_WARMUP_FRAMES; i++) {

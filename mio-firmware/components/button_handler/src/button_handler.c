@@ -9,11 +9,15 @@
 
 static const char *TAG = "BTN";
 
-#define CLICK_WINDOW_MS       400
-#define LONGPRESS_MIN_MS      2500
-#define LONGPRESS_MAX_MS      3500
-#define DEBOUNCE_MS           40
-#define CONFIRM_TIMEOUT_MS    5000
+#define CLICK_WINDOW_MS          400
+#define LONGPRESS_MIN_MS         2500
+#define LONGPRESS_MAX_MS         3500
+#define DEBOUNCE_MS              40
+
+// Updated confirmation windows:
+// Gives 3 seconds overall to respond, and 2.5 seconds to register a 2nd click ("NO")
+#define CONFIRM_TIMEOUT_MS       6000
+#define CONFIRM_CLICK_WINDOW_MS  2000
 
 static TaskHandle_t s_btn_task = NULL;
 
@@ -51,13 +55,13 @@ static void enter_confirm(core_command_t cmd) {
 
     int first = wait_for_press(CONFIRM_TIMEOUT_MS);
     if (first < 0) {  // -2 timeout, or -1 noise -- either way, no clean "yes"
-        ESP_LOGI(TAG, "confirm: no response, cancelling");
+        ESP_LOGI(TAG, "confirm: no response within 3s, cancelling");
         tft_display_on_button_cancelled(cmd, true);
         return;
     }
 
-    // 1 click so far = tentative YES, 2nd click within window = NO
-    int second = wait_for_press(CLICK_WINDOW_MS);
+    // 1 click so far = tentative YES, 2nd click within 2.5s window = NO
+    int second = wait_for_press(CONFIRM_CLICK_WINDOW_MS);
     if (second >= 0) {
         ESP_LOGI(TAG, "confirm: user said NO");
         tft_display_on_button_cancelled(cmd, false);
