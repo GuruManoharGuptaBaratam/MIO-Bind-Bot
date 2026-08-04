@@ -1,8 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "uart_protocol.h"
 #include "servo_control.h"
 #include "wifi_client.h"
@@ -12,7 +14,7 @@
 
 static const char *TAG = "mio_cam";
 
-#define KANSEI_UPLOAD_URL "http://192.168.1.100:8000/upload"
+#define KANSEI_UPLOAD_URL "https://manoharguptabaratam--mio-kansei-kansei-kansei.modal.run"
 #define USER_REF_IMAGE_PATH "/sdcard/user_ref.jpg"
 
 #define MAX_KANSEI_FRAMES 4
@@ -132,9 +134,12 @@ static void handle_kansei(const cam_trigger_packet_t *packet)
     s_kansei_frame_count = 0;
     servo_pan_sweep(on_kansei_angle_fast);
 
-    // 3. Connect to Wi-Fi after physical movement finishes (servo resting at 90 deg)
-    if (packet->has_wifi_creds) {
+    // 3. Update Wi-Fi credentials if provided by Core, otherwise fall back to default
+    if (packet->has_wifi_creds && strlen(packet->ssid) > 0) {
+        ESP_LOGI(TAG, "kansei: using Wi-Fi credentials from Core UART packet");
         wifi_client_set_credentials(packet->ssid, packet->password);
+    } else {
+        ESP_LOGI(TAG, "kansei: no packet creds provided, using default boot credentials");
     }
 
     if (wifi_client_connect(10000) != ESP_OK) {
@@ -147,23 +152,36 @@ static void handle_kansei(const cam_trigger_packet_t *packet)
     // 4. Read user reference image on-demand from SD card
     load_user_ref_image(&s_current_user_ref);
 
-    // 5. Send all frames in 1 single HTTP multipart POST
+    // 5. Send all frames in 1 single HTTP multipart POST, get back description text + raw PCM16 audio
+    uint8_t *audio_buf = NULL;
+    size_t audio_len = 0;
+    char description_text[512] = {0};
     int status = 0;
+
     esp_err_t err = http_send_batch_kansei_frames(
         s_kansei_frames, s_kansei_frame_count,
         s_current_user_ref.buf, s_current_user_ref.len,
-        KANSEI_UPLOAD_URL, &status
+        KANSEI_UPLOAD_URL,
+        &audio_buf, &audio_len,
+        description_text, sizeof(description_text),
+        &status
     );
 
-    if (err != ESP_OK) {
+    if (err != ESP_OK || !audio_buf) {
         ESP_LOGW(TAG, "kansei: batch upload failed (status=%d)", status);
         uart_protocol_send_event(CAM_EVENT_JOB_FAILED, NULL, 0);
     } else {
-        ESP_LOGI(TAG, "kansei: batch uploaded %d frames successfully", (int)s_kansei_frame_count);
+        ESP_LOGI(TAG, "kansei: got description (%zu bytes text, %zu bytes audio): %s",
+                 strlen(description_text), audio_len, description_text);
+        
+        // Stream audio back to ESP32-Core over UART
+        uart_protocol_send_audio_stream(audio_buf, audio_len);
+        
+        heap_caps_free(audio_buf); // PSRAM-allocated by wifi_client, caller owns it
         uart_protocol_send_event(CAM_EVENT_JOB_DONE, NULL, 0);
     }
 
-    // 6. Cleanup PSRAM buffers and drop Wi-Fi connection
+    // 6. Guaranteed Cleanup of PSRAM buffers and Wi-Fi connection
     free_user_ref_image(&s_current_user_ref);
     clear_kansei_frames();
     wifi_client_disconnect();
@@ -303,5 +321,6 @@ void app_main(void)
     }
     wifi_client_disconnect();
 
-    xTaskCreatePinnedToCore(uart_listener_task, "uart_listener", 8192, NULL, 5, NULL, 1);
+    /* 4. CREATE TASK WITH EXPANDED 12KB STACK TO PREVENT STACK OVERFLOW DURING HTTP/TLS PROCESSING */
+    xTaskCreatePinnedToCore(uart_listener_task, "uart_listener", 12288, NULL, 5, NULL, 1);
 }

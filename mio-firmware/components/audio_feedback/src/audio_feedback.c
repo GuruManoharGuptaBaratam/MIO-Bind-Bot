@@ -1,17 +1,19 @@
 #include "audio_feedback.h"
 #include <string.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/ringbuf.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 
 static const char *TAG = "audio_fb";
 
 #define ADPCM_READ_CHUNK_BYTES  128   
 #define PCM_OUT_CHUNK_BYTES     (ADPCM_READ_CHUNK_BYTES * 4) 
-#define FEEDBACK_RB_BYTES       8192  
+#define FEEDBACK_RB_BYTES       32768 // Increased ring buffer to withstand TFT traffic  
 #define DEBOUNCE_MS             400
 
 #define FEEDBACK_GAIN_NUM       2     
@@ -49,7 +51,6 @@ DECLARE_CLIP(confkan)   DECLARE_CLIP(confkir)   DECLARE_CLIP(confiba)
 DECLARE_CLIP(cnlkan)    DECLARE_CLIP(cnlkir)    DECLARE_CLIP(cnliba)
 DECLARE_CLIP(cnltout)   DECLARE_CLIP(btnbusy)
 
-/* Declarations for generated ADPCM files */
 DECLARE_CLIP(procbg)    DECLARE_CLIP(camerr)
 
 static const sound_def_t k_sounds[SND_COUNT] = {
@@ -121,11 +122,12 @@ static volatile bool   s_abort_current = false;
 static int64_t         s_last_played_us[SND_COUNT] = {0};
 static volatile sound_id_t s_pending_deferred = SND_COUNT;
 static volatile int64_t s_trigger_ts_us = 0;
-static volatile bool    s_wideband_active = true; 
+static volatile bool    s_wideband_active = false; 
 
-/* Ambient Loop Control Variables */
 static volatile bool       s_is_looping_active = false;
 static volatile sound_id_t s_current_loop_id = SND_COUNT;
+
+#define SND_ID_STREAMING ((sound_id_t)0xFE)
 
 static void drain_ringbuf(void) {
     size_t sz;
@@ -135,7 +137,84 @@ static void drain_ringbuf(void) {
     }
 }
 
+bool audio_feedback_push_direct_pcm(const uint8_t *pcm_data, size_t len) {
+    if (!s_rb || !pcm_data || len == 0) return false;
+
+    const int16_t *src = (const int16_t *)pcm_data;
+    size_t total_samples = len / 2; // 16-bit PCM = 2 bytes per sample
+
+    uint8_t out_buf[256];
+    size_t out_idx = 0;
+
+    if (s_wideband_active) {
+        // mSBC session: source is 16kHz, link consumes 16kHz. Pass through 1:1.
+        size_t needed = total_samples * 2;
+        size_t free_bytes = xRingbufferGetCurFreeSize(s_rb);
+        if (free_bytes < needed * 2) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+
+        for (size_t i = 0; i < total_samples; i++) {
+            int16_t s = apply_gain(src[i]);
+            out_buf[out_idx++] = (uint8_t)(s & 0xFF);
+            out_buf[out_idx++] = (uint8_t)((s >> 8) & 0xFF);
+            if (out_idx >= sizeof(out_buf)) {
+                xRingbufferSend(s_rb, out_buf, out_idx, pdMS_TO_TICKS(10));
+                out_idx = 0;
+            }
+        }
+    } else {
+        // CVSD session: source is 16kHz, link consumes 8kHz.
+        // Decimate 2:1 by averaging pairs — same technique play_clip() already
+        // uses for embedded ADPCM clips, so streamed kansei audio matches the
+        // pitch/speed of every other sound on the device.
+        size_t pair_count = total_samples / 2;
+        size_t needed = pair_count * 2;
+        size_t free_bytes = xRingbufferGetCurFreeSize(s_rb);
+        if (free_bytes < needed * 2) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+
+        for (size_t i = 0; i + 1 < total_samples; i += 2) {
+            int16_t s_ds = apply_gain((int16_t)(((int32_t)src[i] + (int32_t)src[i + 1]) / 2));
+            out_buf[out_idx++] = (uint8_t)(s_ds & 0xFF);
+            out_buf[out_idx++] = (uint8_t)((s_ds >> 8) & 0xFF);
+            if (out_idx >= sizeof(out_buf)) {
+                xRingbufferSend(s_rb, out_buf, out_idx, pdMS_TO_TICKS(10));
+                out_idx = 0;
+            }
+        }
+        // total_samples is guaranteed even: UART_AUDIO_CHUNK_SIZE = 320 bytes
+        // = 160 samples per call, always even, so no leftover odd sample.
+    }
+
+    if (out_idx > 0) {
+        xRingbufferSend(s_rb, out_buf, out_idx, pdMS_TO_TICKS(10));
+    }
+
+    return true;
+}
+
+void audio_feedback_direct_stream_start(void) {
+    s_active_id = SND_ID_STREAMING;
+    s_abort_current = false;
+    ESP_LOGI(TAG, "Direct audio playback started");
+}
+
+void audio_feedback_direct_stream_end(void) {
+    // FIX FOR CRASH/STATIC SOUND AT END OF DESC:
+    // Append 640 bytes (20ms) of PCM zeros to let the Bluetooth SCO decoder/earbuds
+    // exit gracefully without buffer underrun clicks or static pops.
+    uint8_t zero_padding[640] = {0};
+    xRingbufferSend(s_rb, zero_padding, sizeof(zero_padding), pdMS_TO_TICKS(100));
+
+    s_active_id = SND_COUNT;
+    ESP_LOGI(TAG, "Direct audio playback completed cleanly");
+}
+
 static void play_clip(sound_id_t id) {
+    if (id == SND_ID_STREAMING) return;
+
     const sound_def_t *def = &k_sounds[id];
     const uint8_t *p = def->fl_start;
     const uint8_t *end = def->fl_end;
@@ -144,7 +223,7 @@ static void play_clip(sound_id_t id) {
     ESP_LOGI(TAG, "play_clip: id=%d flash_bytes=%td", (int)id, clip_bytes);
 
     if (clip_bytes < 4) {
-        ESP_LOGE(TAG, "play_clip: id=%d has invalid/empty flash region (%td bytes)", (int)id, clip_bytes);
+        ESP_LOGE(TAG, "play_clip: id=%d has invalid/empty flash region", (int)id);
         s_active_id = SND_COUNT;
         return;
     }
@@ -187,18 +266,20 @@ static void play_clip(sound_id_t id) {
         }
 
         BaseType_t sent = xRingbufferSend(s_rb, pcm_buf, out_idx, pdMS_TO_TICKS(200));
-        if (sent != pdTRUE) {
-            ESP_LOGW(TAG, "play_clip: id=%d xRingbufferSend timed out", (int)id);
-        } else {
+        if (sent == pdTRUE) {
             total_pushed += out_idx;
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
         p += n;
     }
 
+    // Append small silence on internal clip end as well
+    uint8_t zero_padding[320] = {0};
+    xRingbufferSend(s_rb, zero_padding, sizeof(zero_padding), pdMS_TO_TICKS(50));
+
     ESP_LOGI(TAG, "play_clip: id=%d done, pushed %u PCM bytes", (int)id, (unsigned)total_pushed);
     s_active_id = SND_COUNT;
 
-    /* Seamless re-triggering if background looping is active and wasn't aborted */
     if (s_is_looping_active && id == s_current_loop_id && !s_abort_current) {
         xQueueSend(s_trigger_q, (void*)&s_current_loop_id, 0);
     }
@@ -229,53 +310,42 @@ bool audio_feedback_init(void) {
     return true;
 }
 
+static inline priority_t active_priority(sound_id_t id) {
+    return (id == SND_ID_STREAMING) ? PRIO_STATE : k_sounds[id].prio;
+}
+
 void audio_feedback_play(sound_id_t id) {
-    if (id >= SND_COUNT || !s_trigger_q) {
-        ESP_LOGW(TAG, "audio_feedback_play: id=%d rejected (bad id or not init'd)", (int)id);
-        return;
-    }
+    if (id >= SND_COUNT || !s_trigger_q) return;
 
     int64_t now = esp_timer_get_time();
-    if (now - s_last_played_us[id] < DEBOUNCE_MS * 1000) {
-        ESP_LOGI(TAG, "audio_feedback_play: id=%d debounced", (int)id);
-        return;
-    }
+    if (now - s_last_played_us[id] < DEBOUNCE_MS * 1000) return;
     s_last_played_us[id] = now;
 
     priority_t new_prio = k_sounds[id].prio;
 
     if (s_active_id != SND_COUNT) {
-        priority_t active_prio = k_sounds[s_active_id].prio;
+        priority_t active_prio = active_priority(s_active_id);
         if (new_prio == PRIO_CRITICAL && active_prio != PRIO_CRITICAL) {
-            ESP_LOGI(TAG, "audio_feedback_play: id=%d preempting active id=%d", (int)id, (int)s_active_id);
             s_abort_current = true;
             drain_ringbuf();
         } else if (new_prio == PRIO_INFO && s_active_id != s_current_loop_id) {
-            ESP_LOGI(TAG, "audio_feedback_play: id=%d dropped (INFO, busy with id=%d)", (int)id, (int)s_active_id);
             return;
         } else if (s_active_id == s_current_loop_id) {
-            /* Stop active looping when higher priority speech arrives */
             s_abort_current = true;
             drain_ringbuf();
         }
     }
 
-    ESP_LOGI(TAG, "audio_feedback_play: id=%d queued", (int)id);
     s_trigger_ts_us = now;
     xQueueSend(s_trigger_q, &id, 0);
 }
 
 void audio_feedback_set_wideband(bool wideband) {
-    if (s_wideband_active != wideband) {
-        ESP_LOGI(TAG, "audio_feedback_set_wideband: now %s", 
-                 wideband ? "WIDEBAND (mSBC, 16kHz)" : "NARROWBAND (CVSD, 8kHz -- downsampling on the fly)");
-    }
     s_wideband_active = wideband;
 }
 
 void audio_feedback_defer_until_connected(sound_id_t id) {
     if (id >= SND_COUNT) return;
-    ESP_LOGI(TAG, "audio_feedback_defer_until_connected: id=%d (waiting for SCO)", (int)id);
     s_pending_deferred = id;
 }
 
@@ -283,31 +353,15 @@ void audio_feedback_flush_pending(void) {
     if (s_pending_deferred == SND_COUNT) return;
     sound_id_t id = s_pending_deferred;
     s_pending_deferred = SND_COUNT;
-    ESP_LOGI(TAG, "audio_feedback_flush_pending: playing deferred id=%d now that SCO is up", (int)id);
     audio_feedback_play(id);
 }
 
 size_t audio_feedback_pull_frame(uint8_t *buf, size_t max_len) {
     if (!s_rb) return 0;
-    static bool s_was_flowing = false;
     size_t sz;
     void *item = xRingbufferReceiveUpTo(s_rb, &sz, 0, max_len);
-    if (!item) {
-        if (s_active_id != SND_COUNT && !s_is_looping_active) {
-            ESP_LOGW(TAG, "pull_frame: MID_CLIP_UNDERRUN id=%d -- producer falling behind consumer", (int)s_active_id);
-        } else if (s_was_flowing) {
-            ESP_LOGI(TAG, "pull_frame: feedback audio drained (BT stack now getting sidetone again)");
-        }
-        s_was_flowing = false;
-        return 0;
-    }
-    if (!s_was_flowing) {
-        int64_t latency_ms = (esp_timer_get_time() - s_trigger_ts_us) / 1000;
-        ESP_LOGI(TAG, "pull_frame: feedback audio now flowing to BT stack "
-                       "(max_len=%u, got=%u, TRIGGER_TO_AUDIBLE_MS=%lld)",
-                 (unsigned)max_len, (unsigned)sz, (long long)latency_ms);
-        s_was_flowing = true;
-    }
+    if (!item) return 0;
+
     memcpy(buf, item, sz);
     vRingbufferReturnItem(s_rb, item);
     return sz;

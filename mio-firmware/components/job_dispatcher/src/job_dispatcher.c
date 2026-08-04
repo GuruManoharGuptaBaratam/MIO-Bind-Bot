@@ -108,7 +108,7 @@ void job_dispatcher_on_command(core_command_t cmd)
         
         // 3. Starts "SWEEPING..." display state & initiates periodic reminder loop
         tft_display_on_command_processing(SND_SCENE_PROCESSING);
-        set_busy_state_with_timeout(60000); // 60s timeout window
+        set_busy_state_with_timeout(300000); // 120s timeout window
 
         int16_t pitch_centideg = 0;
         if (mpu6050_read_pitch_centideg(&pitch_centideg) != ESP_OK) {

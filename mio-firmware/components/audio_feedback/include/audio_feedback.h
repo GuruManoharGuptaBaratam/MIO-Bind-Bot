@@ -51,6 +51,23 @@ void audio_feedback_defer_until_connected(sound_id_t id);
 void audio_feedback_flush_pending(void);
 size_t audio_feedback_pull_frame(uint8_t *buf, size_t max_len);
 
+/* --- DIRECT LIVE PASS-THROUGH STREAMING FUNCTIONS --- */
+
+/**
+ * @brief Marks state as streaming and resets abort flags.
+ */
+void audio_feedback_direct_stream_start(void);
+
+/**
+ * @brief Pushes incoming PCM chunk straight into the Bluetooth RingBuffer.
+ */
+bool audio_feedback_push_direct_pcm(const uint8_t *pcm_data, size_t len);
+
+/**
+ * @brief Appends zero-padding to fade out audio and prevents earbud pops/crashes at stream end.
+ */
+void audio_feedback_direct_stream_end(void);
+
 #ifdef __cplusplus
 }
 #endif

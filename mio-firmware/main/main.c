@@ -119,6 +119,10 @@ void app_main(void)
     // that's the first thing in boot that triggers a feedback sound.
     if (!audio_feedback_init()) {
         ESP_LOGE(TAG, "audio_feedback_init failed -- state feedback disabled");
+    } else {
+        // Force 8 kHz mode so 16 kHz streams are automatically downsampled
+        // to match standard 8 kHz CVSD earbuds playback speed
+        audio_feedback_set_wideband(false);
     }
 
     // 3. Read SD config
