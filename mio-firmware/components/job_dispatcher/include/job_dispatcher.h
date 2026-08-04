@@ -14,6 +14,7 @@ void job_dispatcher_on_event(core_event_t evt);
 // Used by button_handler.c to avoid showing a confirm prompt (or
 // dispatching) while a command is already running.
 bool job_dispatcher_is_busy(void);
+void job_dispatcher_cancel_timeout(void);
 
 #ifdef __cplusplus
 }

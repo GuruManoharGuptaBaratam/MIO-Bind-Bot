@@ -138,8 +138,11 @@ void uart_protocol_send_audio_stream(const uint8_t *audio_data, size_t audio_len
         offset += chunk_len;
         seq++;
 
-        // Rate pacing: 10ms delay per 320 bytes exactly matches Bluetooth SCO consumption rate
-        vTaskDelay(pdMS_TO_TICKS(10));
+        // Rate pacing: 160 samples = 20ms at 8kHz 16-bit mono.
+        // Must match the true sample rate of audio_data as emitted by
+        // kansei_modal.py. If that ever goes back to 16kHz, this must
+        // go back to 10ms.
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 
     ESP_LOGI(TAG, "Audio stream sent directly: %u bytes in %u chunks", (unsigned)audio_len, seq);

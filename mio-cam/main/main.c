@@ -134,16 +134,18 @@ static void handle_kansei(const cam_trigger_packet_t *packet)
     s_kansei_frame_count = 0;
     servo_pan_sweep(on_kansei_angle_fast);
 
-    // 3. Update Wi-Fi credentials if provided by Core, otherwise fall back to default
-    if (packet->has_wifi_creds && strlen(packet->ssid) > 0) {
-        ESP_LOGI(TAG, "kansei: using Wi-Fi credentials from Core UART packet");
-        wifi_client_set_credentials(packet->ssid, packet->password);
-    } else {
-        ESP_LOGI(TAG, "kansei: no packet creds provided, using default boot credentials");
-    }
+    // 3. Determine credentials dynamically from Core UART packet, with fallback to default macros
+    const char *target_ssid = (packet->has_wifi_creds && strlen(packet->ssid) > 0) ? packet->ssid : WIFI_SSID;
+    const char *target_pass = (packet->has_wifi_creds && strlen(packet->ssid) > 0) ? packet->password : WIFI_PASSWORD;
 
-    if (wifi_client_connect(10000) != ESP_OK) {
-        ESP_LOGE(TAG, "kansei: wifi connect failed, aborting upload");
+    const char *fallback_ssid = WIFI_SSID; 
+    const char *fallback_pass = WIFI_PASSWORD;
+
+    ESP_LOGI(TAG, "kansei: attempting connection with adaptive fallback...");
+
+    // Try Core/Primary credentials first, fallback to default macro credentials if it fails (5s timeout each)
+    if (wifi_client_connect_with_fallback(target_ssid, target_pass, fallback_ssid, fallback_pass, 5000) != ESP_OK) {
+        ESP_LOGE(TAG, "kansei: all Wi-Fi connection attempts failed, aborting upload");
         clear_kansei_frames();
         uart_protocol_send_event(CAM_EVENT_JOB_FAILED, NULL, 0);
         return;
@@ -177,7 +179,7 @@ static void handle_kansei(const cam_trigger_packet_t *packet)
         // Stream audio back to ESP32-Core over UART
         uart_protocol_send_audio_stream(audio_buf, audio_len);
         
-        heap_caps_free(audio_buf); // PSRAM-allocated by wifi_client, caller owns it
+        heap_caps_free(audio_buf);
         uart_protocol_send_event(CAM_EVENT_JOB_DONE, NULL, 0);
     }
 

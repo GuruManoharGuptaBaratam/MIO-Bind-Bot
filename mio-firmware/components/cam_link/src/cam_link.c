@@ -1,6 +1,7 @@
 #include "cam_link.h"
 #include "sd_config.h"
 #include "audio_feedback.h"
+#include "job_dispatcher.h"  // Header added to access job_dispatcher_cancel_timeout()
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -115,6 +116,9 @@ static bool cam_link_handle_audio_chunk(void) {
 
     if (is_first) {
         audio_feedback_direct_stream_start();
+        
+        // Cancels the job_dispatcher timer as soon as the first byte streams in
+        job_dispatcher_cancel_timeout();
     }
 
     // Push raw PCM directly to Bluetooth ringbuffer

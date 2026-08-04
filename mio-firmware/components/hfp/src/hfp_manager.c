@@ -84,6 +84,12 @@ static void incoming_data_callback(const uint8_t *buf, uint32_t len)
     if (!s_audio_rb || !buf || len == 0) {
         return;
     }
+    static uint32_t s_last_logged_rate = 0;
+    if (g_negotiated_sample_rate != s_last_logged_rate) {
+        ESP_LOGI(TAG, "incoming_data_callback: mic path now treating input as %lu Hz",
+                 (unsigned long)g_negotiated_sample_rate);
+        s_last_logged_rate = g_negotiated_sample_rate;
+    }
 
     // Keep the loopback copy (used by outgoing_data_callback for sidetone)
     uint32_t loop_len = len < sizeof(s_loopback_buf) ? len : sizeof(s_loopback_buf);
@@ -211,15 +217,27 @@ static void hfp_callback(
                     break;
 
                 case ESP_HF_AUDIO_STATE_CONNECTED_MSBC:
-                    g_active_codec = HFP_CODEC_MSBC;
-                    g_negotiated_sample_rate = 16000;
-                    ESP_LOGI(TAG, "SCO: CONNECTED mSBC (16 kHz dynamically set)");
+                    // Some remotes (e.g. ones without 3-EDR eSCO support) fire this
+                    // event even after BCS negotiation actually fell back to CVSD.
+                    // g_active_codec was already set by the last ESP_HF_BCS_RESPONSE_EVT,
+                    // so trust that instead of this event's name.
+                    if (g_active_codec == HFP_CODEC_MSBC) {
+                        g_negotiated_sample_rate = 16000;
+                        ESP_LOGI(TAG, "SCO: CONNECTED mSBC confirmed by BCS (16 kHz)");
+                        audio_feedback_set_wideband(true);
+                    } else {
+                        g_active_codec = HFP_CODEC_CVSD;
+                        g_negotiated_sample_rate = 8000;
+                        ESP_LOGW(TAG, "SCO: AUDIO_STATE said mSBC but BCS last confirmed CVSD -- "
+                                      "using CVSD (8 kHz) for both mic and speaker paths");
+                        audio_feedback_set_wideband(false);
+                    }
+
                     esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
                     esp_bt_sleep_disable();
                     gpio_set_level(PIN_BT_STATUS_OUT, 1);
                     s_sco_connected = true;
                     tft_display_on_bt_state(true);
-                    audio_feedback_set_wideband(true);
                     audio_feedback_flush_pending();
                     break;
 

@@ -14,8 +14,7 @@
 
 static const char *TAG = "wifi_client";
 
-#define WIFI_CONNECT_MAX_RETRIES 5
-
+#define WIFI_PER_PROFILE_RETRIES 3
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
@@ -38,16 +37,16 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         s_connected = false;
         if (s_disconnect_requested) {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-        } else if (s_retry_count < WIFI_CONNECT_MAX_RETRIES) {
-            esp_wifi_connect();
+        } else if (s_retry_count < WIFI_PER_PROFILE_RETRIES) {
             s_retry_count++;
-            ESP_LOGW(TAG, "retrying wifi connect (%d/%d)", s_retry_count, WIFI_CONNECT_MAX_RETRIES);
+            ESP_LOGW(TAG, "Retrying current Wi-Fi profile (%d/%d)...", s_retry_count, WIFI_PER_PROFILE_RETRIES);
+            esp_wifi_connect();
         } else {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
-        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "Connected successfully! Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_count = 0;
         s_connected = true;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
@@ -169,7 +168,44 @@ esp_err_t wifi_client_connect(uint32_t timeout_ms)
     }
 
     ESP_LOGE(TAG, "wifi connect failed or timed out");
-    esp_wifi_stop();
+    wifi_client_disconnect();
+    return ESP_FAIL;
+}
+
+// ADAPTIVE FALLBACK WRAPPER
+esp_err_t wifi_client_connect_with_fallback(const char *primary_ssid, const char *primary_pass,
+                                              const char *backup_ssid, const char *backup_pass,
+                                              uint32_t timeout_ms)
+{
+    if (!s_initialized) {
+        ESP_LOGE(TAG, "wifi_client_init() not called yet");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // 1. Try Primary Credentials
+    if (primary_ssid && strlen(primary_ssid) > 0) {
+        ESP_LOGI(TAG, "Trying Primary Wi-Fi: '%s'", primary_ssid);
+        wifi_client_set_credentials(primary_ssid, primary_pass);
+        
+        if (wifi_client_connect(timeout_ms) == ESP_OK) {
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "Primary Wi-Fi failed. Disconnecting before fallback...");
+        wifi_client_disconnect();
+    }
+
+    // 2. Try Backup Credentials (if provided and distinct)
+    if (backup_ssid && strlen(backup_ssid) > 0 && strcmp(primary_ssid, backup_ssid) != 0) {
+        ESP_LOGI(TAG, "Switching to Backup Wi-Fi: '%s'", backup_ssid);
+        wifi_client_set_credentials(backup_ssid, backup_pass);
+        
+        if (wifi_client_connect(timeout_ms) == ESP_OK) {
+            return ESP_OK;
+        }
+        ESP_LOGE(TAG, "Backup Wi-Fi also failed.");
+        wifi_client_disconnect();
+    }
+
     return ESP_FAIL;
 }
 
@@ -240,15 +276,7 @@ esp_err_t http_send_image_frame(const uint8_t *jpeg_data,
     return (status >= 200 && status < 300) ? ESP_OK : ESP_FAIL;
 }
 
-// Raw 16kHz mono PCM16 runs ~32 KB/s -- a ~45s worst-case description tops
-// out around 1.5MB. This is a fallback cap only; we prefer the real
-// Content-Length from the response headers when the server provides one
-// (Modal's Response(content=bytes) sets it, since the body isn't chunked).
 #define KANSEI_MAX_RESPONSE_BYTES (2048 * 1024)
-
-// Compile-time swap point: set this to your real Modal secret, or better,
-// load it from SD config alongside the WiFi credentials so it's not baked
-// into the firmware image.
 #define MIO_SHARED_SECRET "4ea256147e1602ff22bba0499e26bd4d"
 
 esp_err_t http_send_batch_kansei_frames(camera_fb_t **frames, size_t frame_count,
@@ -272,15 +300,8 @@ esp_err_t http_send_batch_kansei_frames(camera_fb_t **frames, size_t frame_count
         out_text_buf[0] = '\0';
     }
 
-    // Change this line in wifi_client.c:
     const char *boundary = "MioKanseiBoundary7MA4YWxkTrZu0gW";
 
-    // Build every part's header up front and sum the exact body length so we
-    // can declare a real Content-Length instead of opening with -1 (chunked
-    // transfer encoding). Modal's front-end proxy resets the connection
-    // mid-upload when it doesn't get an upfront length -- this is a common
-    // mismatch between esp_http_client's "-1 means chunked" default and
-    // gateways that expect to know the body size before forwarding.
 #define WIFI_MAX_MULTIPART_PARTS 9
     if (frame_count > WIFI_MAX_MULTIPART_PARTS - 1) {
         ESP_LOGE(TAG, "frame_count %zu exceeds max supported parts (%d)",
@@ -301,7 +322,7 @@ esp_err_t http_send_batch_kansei_frames(camera_fb_t **frames, size_t frame_count
             "Content-Type: image/jpeg\r\n\r\n",
             boundary, (int)i, (int)i);
         part_header_len[part_count] = len;
-        body_len += (size_t)len + frames[i]->len + 2; // +2 for trailing \r\n after the data
+        body_len += (size_t)len + frames[i]->len + 2;
         part_count++;
     }
 
@@ -327,8 +348,6 @@ esp_err_t http_send_batch_kansei_frames(camera_fb_t **frames, size_t frame_count
     esp_http_client_config_t config = {
         .url = url,
         .method = HTTP_METHOD_POST,
-        // Cold-start CPU inference + edge-tts round trip can run long;
-        // 12s was fine for a single-frame POST but is too tight here.
         .timeout_ms = 90000,
         .buffer_size = 1024,
         .buffer_size_tx = 1024,
@@ -346,7 +365,7 @@ esp_err_t http_send_batch_kansei_frames(camera_fb_t **frames, size_t frame_count
     esp_http_client_set_header(client, "Content-Type", content_type_header);
     esp_http_client_set_header(client, "X-Mio-Key", MIO_SHARED_SECRET);
 
-    esp_err_t err = esp_http_client_open(client, (int)body_len); // real length, not -1
+    esp_err_t err = esp_http_client_open(client, (int)body_len);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
@@ -383,9 +402,6 @@ esp_err_t http_send_batch_kansei_frames(camera_fb_t **frames, size_t frame_count
     esp_err_t result = ESP_FAIL;
 
     if (status >= 200 && status < 300) {
-        // Prefer the real Content-Length so we don't over-allocate PSRAM on
-        // every call; fall back to the hard cap if the server didn't send
-        // one (e.g. chunked transfer).
         size_t alloc_cap = (content_len > 0 && (size_t)content_len <= KANSEI_MAX_RESPONSE_BYTES)
                                 ? (size_t)content_len
                                 : KANSEI_MAX_RESPONSE_BYTES;
@@ -406,14 +422,13 @@ esp_err_t http_send_batch_kansei_frames(camera_fb_t **frames, size_t frame_count
                 break;
             }
             if (r == 0) {
-                break; // response fully read
+                break;
             }
             total_read += (size_t)r;
         }
 
         ESP_LOGI(TAG, "Read %u bytes of response body", (unsigned)total_read);
 
-        // Frame: [4-byte LE text length][UTF-8 text][remaining bytes = mSBC audio]
         if (total_read < 4) {
             ESP_LOGE(TAG, "Response too short to contain framing header");
             heap_caps_free(response_buf);

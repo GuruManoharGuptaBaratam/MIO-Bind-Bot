@@ -170,6 +170,19 @@ static void apply_kv(const char *key, const char *value)
         g_sd_config.wifi_password[SD_CFG_WIFI_PASS_MAXLEN - 1] = '\0';
         return;
     }
+    // NEW: Backup Wi-Fi configuration parsing
+    if (strcmp(key, "WIFI_SSID_2") == 0) {
+        strncpy(g_sd_config.wifi_ssid_backup, value, SD_CFG_WIFI_SSID_MAXLEN - 1);
+        g_sd_config.wifi_ssid_backup[SD_CFG_WIFI_SSID_MAXLEN - 1] = '\0';
+        g_sd_config.has_backup_wifi = (strlen(g_sd_config.wifi_ssid_backup) > 0);
+        return;
+    }
+
+    if (strcmp(key, "WIFI_PASS_2") == 0) {
+        strncpy(g_sd_config.wifi_password_backup, value, SD_CFG_WIFI_PASS_MAXLEN - 1);
+        g_sd_config.wifi_password_backup[SD_CFG_WIFI_PASS_MAXLEN - 1] = '\0';
+        return;
+    }
 
     if (strncmp(key, "SOS", 3) == 0 && strlen(key) >= 5) {
         int idx = key[3] - '1';

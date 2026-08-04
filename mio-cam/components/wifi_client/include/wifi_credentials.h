@@ -1,9 +1,10 @@
 #pragma once
 
-/* TEMPORARY: hardcoded until the Core->CAM UART protocol supports
- * variable-length packets and can relay WIFI_SSID / WIFI_PASS read
- * from config.txt on the SD card. Move these back out once that's
- * built -- don't commit real credentials to a public repo. */
+/* Fallback hardcoded credentials used if SD card configuration is not loaded */
 
-#define WIFI_SSID     "Manohar"
-#define WIFI_PASSWORD "geethika"
+#define WIFI_SSID           "Manohar"
+#define WIFI_PASSWORD       "geethika"
+
+// NEW: Backup Wi-Fi Fallback Credentials (Hotspot / Outdoor)
+#define WIFI_SSID_BACKUP    "ManoharGupta"
+#define WIFI_PASS_BACKUP    "nhay2849"

@@ -107,8 +107,7 @@ void job_dispatcher_on_command(core_command_t cmd)
         vTaskDelay(pdMS_TO_TICKS(1500));
         
         // 3. Starts "SWEEPING..." display state & initiates periodic reminder loop
-        tft_display_on_command_processing(SND_SCENE_PROCESSING);
-        set_busy_state_with_timeout(300000); // 120s timeout window
+        set_busy_state_with_timeout(90000); // Extended to 90s timeout window
 
         int16_t pitch_centideg = 0;
         if (mpu6050_read_pitch_centideg(&pitch_centideg) != ESP_OK) {
@@ -151,4 +150,12 @@ void job_dispatcher_on_event(core_event_t evt)
 bool job_dispatcher_is_busy(void)
 {
     return s_is_system_busy;
+}
+
+void job_dispatcher_cancel_timeout(void)
+{
+    if (s_job_timeout_timer && xTimerIsTimerActive(s_job_timeout_timer)) {
+        xTimerStop(s_job_timeout_timer, 0);
+        ESP_LOGI(TAG, "Audio stream started -- stopped job timeout timer");
+    }
 }

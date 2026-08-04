@@ -12,7 +12,7 @@
 static const char *TAG = "audio_fb";
 
 #define ADPCM_READ_CHUNK_BYTES  128   
-#define PCM_OUT_CHUNK_BYTES     (ADPCM_READ_CHUNK_BYTES * 4) 
+#define PCM_OUT_CHUNK_BYTES     (ADPCM_READ_CHUNK_BYTES * 8) 
 #define FEEDBACK_RB_BYTES       32768 // Increased ring buffer to withstand TFT traffic  
 #define DEBOUNCE_MS             400
 
@@ -146,55 +146,55 @@ bool audio_feedback_push_direct_pcm(const uint8_t *pcm_data, size_t len) {
     uint8_t out_buf[256];
     size_t out_idx = 0;
 
-    if (s_wideband_active) {
-        // mSBC session: source is 16kHz, link consumes 16kHz. Pass through 1:1.
-        size_t needed = total_samples * 2;
-        size_t free_bytes = xRingbufferGetCurFreeSize(s_rb);
-        if (free_bytes < needed * 2) {
-            vTaskDelay(pdMS_TO_TICKS(5));
-        }
+    size_t free_bytes = xRingbufferGetCurFreeSize(s_rb);
+    if (free_bytes < len * 2) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
 
+    if (s_wideband_active) {
+        // mSBC session: link wants 16kHz, but source (Modal TTS) is 8kHz.
+        // Duplicate each sample to fill the 16kHz link. Your earbuds only
+        // negotiate CVSD in practice, so this branch is a safety net, not
+        // the common path -- but kept correct in case mSBC ever negotiates.
+        for (size_t i = 0; i < total_samples; i++) {
+            int16_t s = apply_gain(src[i]);
+            for (int rep = 0; rep < 2; rep++) {
+                out_buf[out_idx++] = (uint8_t)(s & 0xFF);
+                out_buf[out_idx++] = (uint8_t)((s >> 8) & 0xFF);
+                if (out_idx >= sizeof(out_buf)) {
+                    if (xRingbufferSend(s_rb, out_buf, out_idx, pdMS_TO_TICKS(10)) != pdTRUE) {
+                        ESP_LOGW(TAG, "kansei push (wideband): ring buffer full, dropped %u bytes",
+                                 (unsigned)out_idx);
+                    }
+                    out_idx = 0;
+                }
+            }
+        }
+    } else {
+        // CVSD session: link wants 8kHz, source is already 8kHz.
+        // Pure pass-through -- no resampling, no data loss, no pitch/speed shift.
         for (size_t i = 0; i < total_samples; i++) {
             int16_t s = apply_gain(src[i]);
             out_buf[out_idx++] = (uint8_t)(s & 0xFF);
             out_buf[out_idx++] = (uint8_t)((s >> 8) & 0xFF);
             if (out_idx >= sizeof(out_buf)) {
-                xRingbufferSend(s_rb, out_buf, out_idx, pdMS_TO_TICKS(10));
+                if (xRingbufferSend(s_rb, out_buf, out_idx, pdMS_TO_TICKS(10)) != pdTRUE) {
+                    ESP_LOGW(TAG, "kansei push (narrowband): ring buffer full, dropped %u bytes",
+                             (unsigned)out_idx);
+                }
                 out_idx = 0;
             }
         }
-    } else {
-        // CVSD session: source is 16kHz, link consumes 8kHz.
-        // Decimate 2:1 by averaging pairs — same technique play_clip() already
-        // uses for embedded ADPCM clips, so streamed kansei audio matches the
-        // pitch/speed of every other sound on the device.
-        size_t pair_count = total_samples / 2;
-        size_t needed = pair_count * 2;
-        size_t free_bytes = xRingbufferGetCurFreeSize(s_rb);
-        if (free_bytes < needed * 2) {
-            vTaskDelay(pdMS_TO_TICKS(5));
-        }
-
-        for (size_t i = 0; i + 1 < total_samples; i += 2) {
-            int16_t s_ds = apply_gain((int16_t)(((int32_t)src[i] + (int32_t)src[i + 1]) / 2));
-            out_buf[out_idx++] = (uint8_t)(s_ds & 0xFF);
-            out_buf[out_idx++] = (uint8_t)((s_ds >> 8) & 0xFF);
-            if (out_idx >= sizeof(out_buf)) {
-                xRingbufferSend(s_rb, out_buf, out_idx, pdMS_TO_TICKS(10));
-                out_idx = 0;
-            }
-        }
-        // total_samples is guaranteed even: UART_AUDIO_CHUNK_SIZE = 320 bytes
-        // = 160 samples per call, always even, so no leftover odd sample.
     }
 
     if (out_idx > 0) {
-        xRingbufferSend(s_rb, out_buf, out_idx, pdMS_TO_TICKS(10));
+        if (xRingbufferSend(s_rb, out_buf, out_idx, pdMS_TO_TICKS(10)) != pdTRUE) {
+            ESP_LOGW(TAG, "kansei push (flush): ring buffer full, dropped %u bytes", (unsigned)out_idx);
+        }
     }
 
     return true;
 }
-
 void audio_feedback_direct_stream_start(void) {
     s_active_id = SND_ID_STREAMING;
     s_abort_current = false;
@@ -249,19 +249,28 @@ static void play_clip(sound_id_t id) {
             int16_t s0 = adpcm_decode_nibble(byte & 0x0F, &predictor, &step_idx);
             int16_t s1 = adpcm_decode_nibble((byte >> 4) & 0x0F, &predictor, &step_idx);
 
+            int16_t g0 = apply_gain(s0);
+            int16_t g1 = apply_gain(s1);
+
             if (s_wideband_active) {
-                s0 = apply_gain(s0);
-                s1 = apply_gain(s1);
+                // Link is 16kHz (mSBC), but clips are authored at 8kHz.
+                // Upsample by duplicating each decoded sample to fill the 16kHz link.
+                pcm_buf[out_idx++] = (uint8_t)(g0 & 0xFF);
+                pcm_buf[out_idx++] = (uint8_t)((g0 >> 8) & 0xFF);
+                pcm_buf[out_idx++] = (uint8_t)(g0 & 0xFF);
+                pcm_buf[out_idx++] = (uint8_t)((g0 >> 8) & 0xFF);
 
-                pcm_buf[out_idx++] = (uint8_t)(s0 & 0xFF);
-                pcm_buf[out_idx++] = (uint8_t)((s0 >> 8) & 0xFF);
-                pcm_buf[out_idx++] = (uint8_t)(s1 & 0xFF);
-                pcm_buf[out_idx++] = (uint8_t)((s1 >> 8) & 0xFF);
+                pcm_buf[out_idx++] = (uint8_t)(g1 & 0xFF);
+                pcm_buf[out_idx++] = (uint8_t)((g1 >> 8) & 0xFF);
+                pcm_buf[out_idx++] = (uint8_t)(g1 & 0xFF);
+                pcm_buf[out_idx++] = (uint8_t)((g1 >> 8) & 0xFF);
             } else {
-                int16_t s_ds = apply_gain((int16_t)(((int32_t)s0 + (int32_t)s1) / 2));
-
-                pcm_buf[out_idx++] = (uint8_t)(s_ds & 0xFF);
-                pcm_buf[out_idx++] = (uint8_t)((s_ds >> 8) & 0xFF);
+                // Link is 8kHz (CVSD), matches clip's native 8kHz encoding.
+                // Pass both decoded samples through 1:1 -- no averaging/decimation.
+                pcm_buf[out_idx++] = (uint8_t)(g0 & 0xFF);
+                pcm_buf[out_idx++] = (uint8_t)((g0 >> 8) & 0xFF);
+                pcm_buf[out_idx++] = (uint8_t)(g1 & 0xFF);
+                pcm_buf[out_idx++] = (uint8_t)((g1 >> 8) & 0xFF);
             }
         }
 

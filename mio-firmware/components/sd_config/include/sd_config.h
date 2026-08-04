@@ -29,8 +29,14 @@ typedef struct {
 
     sos_contact_t  contacts[SD_CFG_MAX_CONTACTS];
 
+    // Primary Wi-Fi
     char           wifi_ssid[SD_CFG_WIFI_SSID_MAXLEN];
     char           wifi_password[SD_CFG_WIFI_PASS_MAXLEN];
+
+    // Backup / Secondary Wi-Fi (Adaptive Fallback)
+    char           wifi_ssid_backup[SD_CFG_WIFI_SSID_MAXLEN];
+    char           wifi_password_backup[SD_CFG_WIFI_PASS_MAXLEN];
+    bool           has_backup_wifi;
 
     bool           loaded;
 } sd_runtime_config_t;
