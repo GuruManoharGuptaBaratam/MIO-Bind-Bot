@@ -10,6 +10,7 @@ extern "C" {
 
 void tft_display_init(void);
 void tft_display_on_bt_state(bool connected);
+void tft_display_on_wifi_state(bool connected); // NEW: drives the "WF" tag on the idle status row
 void tft_display_on_ie_event(core_event_t evt);
 void tft_display_on_ie_command(core_command_t cmd);
 void tft_display_on_sd_status(sd_boot_status_t status);

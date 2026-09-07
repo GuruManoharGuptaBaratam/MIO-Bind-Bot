@@ -7,6 +7,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "audio_feedback.h"
+#include <math.h>
 
 static const char *TAG = "TFT_DISPLAY";
 
@@ -22,6 +23,8 @@ static const char *TAG = "TFT_DISPLAY";
 
 static ST7735_GFX *s_gfx = nullptr;
 static bool s_bt_connected = false;
+static bool s_wifi_connected = false; // NEW: mirrors ESP32-CAM wifi link state, for idle status row
+static bool s_sd_ok = false;          // NEW: latched from tft_display_on_sd_status(), for idle status row
 static SemaphoreHandle_t s_gfx_mutex = nullptr;
 
 #define NOTIFY_TIMEOUT_MS              2000  // Display "DONE" / "SAVED" / "BUSY" for 2s then back to IDLE
@@ -34,6 +37,30 @@ static esp_timer_handle_t s_state_timeout_timer = nullptr;
 static esp_timer_handle_t s_reminder_timer = nullptr;
 static sound_id_t s_current_processing_sound = SND_SCENE_PROCESSING;
 static bool s_is_processing_active = false; // Tracks if a background processing job is running
+
+// ---------------------------------------------------------------------------
+// Visual design layer (NEW). No new tasks/timers/heap use — the processing
+// "pulse" animation below is driven entirely by the reminder_timer that
+// already existed and already fires every REMINDER_INTERVAL_MS.
+// ---------------------------------------------------------------------------
+static uint8_t s_anim_frame = 0; // 1 byte. advanced by the existing reminder timer only.
+
+typedef enum {
+    ICON_NONE = 0,
+    ICON_LOGO,       // idle
+    ICON_BT_ON,
+    ICON_BT_OFF,
+    ICON_EAR,        // wakeword
+    ICON_MIC,        // listening for command
+    ICON_WARN,       // unrecognized / timeout / cancelled / sd problem
+    ICON_APERTURE,   // kansei (scene / camera)
+    ICON_REC,        // kiroku (recording)
+    ICON_PIN,        // ibasho (location)
+    ICON_CHECK,      // done / saved / ok
+    ICON_SD,         // sd ok
+    ICON_QMARK,      // confirm y/n
+    ICON_BUSY,       // system busy
+} tft_icon_t;
 
 typedef enum {
     TFT_STATE_IDLE_MIO = 0,         
@@ -67,34 +94,35 @@ typedef struct {
     tft_state_t state;
     const char *label;   
     uint16_t color;
+    tft_icon_t icon;
 } tft_state_entry_t;
 
 static const tft_state_entry_t kStateTable[] = {
-    { TFT_STATE_IDLE_MIO,              "MIO",              ST77_WHITE  },
-    { TFT_STATE_BT_CONNECTED,          "CONNECTED",        ST77_GREEN  },
-    { TFT_STATE_BT_DISCONNECTED,       "DISCONNECTED",     ST77_RED    },
-    { TFT_STATE_WAKEWORD_DETECTED,     "HEY MIO!",         ST77_CYAN   },
-    { TFT_STATE_COUNTDOWN_3,           "SPEAK IN 3",       ST77_WHITE  },
-    { TFT_STATE_COUNTDOWN_2,           "SPEAK IN 2",       ST77_WHITE  },
-    { TFT_STATE_COUNTDOWN_1,           "SPEAK IN 1",       ST77_WHITE  },
-    { TFT_STATE_LISTENING_COMMAND,     "LISTENING...",     ST77_CYAN   },
-    { TFT_STATE_COMMAND_UNRECOGNIZED,  "RETRY",            ST77_ORANGE },
-    { TFT_STATE_COMMAND_TIMEOUT,       "TIMEOUT",          ST77_ORANGE },
-    { TFT_STATE_CMD_KANSEI,            "CMD: KANSEI",      ST77_GREEN  },
-    { TFT_STATE_CMD_KIROKU,            "CMD: KIROKU",      ST77_GREEN  },
-    { TFT_STATE_CMD_IBASHO,            "CMD: IBASHO",      ST77_GREEN  },
-    { TFT_STATE_KANSEI_PROCESSING,     "SWEEPING...",      ST77_CYAN   },
-    { TFT_STATE_KIROKU_PROCESSING,     "RECORDING...",     ST77_CYAN   },
-    { TFT_STATE_KANSEI_DONE,           "KANSEI DONE",      ST77_GREEN  },
-    { TFT_STATE_KIROKU_SAVED,          "RECORD SAVED",     ST77_GREEN  },
-    { TFT_STATE_SD_OK,                 "SD: OK",           ST77_GREEN  },
-    { TFT_STATE_SD_NOT_FOUND,          "SD: MISSING",      ST77_RED    },
-    { TFT_STATE_SD_BAD_CONFIG,         "SD: BAD CONFIG",   ST77_ORANGE },
-    { TFT_STATE_CONFIRM_KANSEI,        "KANSEI? Y/N",      ST77_ORANGE },
-    { TFT_STATE_CONFIRM_KIROKU,        "KIROKU? Y/N",      ST77_ORANGE },
-    { TFT_STATE_CONFIRM_IBASHO,        "IBASHO? Y/N",      ST77_ORANGE },
-    { TFT_STATE_CMD_CANCELLED,         "CANCELLED",        ST77_RED    },
-    { TFT_STATE_BTN_BUSY,              "SYSTEM BUSY",      ST77_ORANGE },
+    { TFT_STATE_IDLE_MIO,              "MIO",              ST77_BLUE,   ICON_LOGO     },
+    { TFT_STATE_BT_CONNECTED,          "CONNECTED",        ST77_GREEN,  ICON_BT_ON    },
+    { TFT_STATE_BT_DISCONNECTED,       "DISCONNECTED",     ST77_RED,    ICON_BT_OFF   },
+    { TFT_STATE_WAKEWORD_DETECTED,     "HEY MIO!",         ST77_CYAN,   ICON_EAR      },
+    { TFT_STATE_COUNTDOWN_3,           "SPEAK NOW",        ST77_WHITE,  ICON_NONE     }, // ring+digit, drawn separately
+    { TFT_STATE_COUNTDOWN_2,           "SPEAK NOW",        ST77_WHITE,  ICON_NONE     },
+    { TFT_STATE_COUNTDOWN_1,           "SPEAK NOW",        ST77_WHITE,  ICON_NONE     },
+    { TFT_STATE_LISTENING_COMMAND,     "LISTENING...",     ST77_CYAN,   ICON_MIC      },
+    { TFT_STATE_COMMAND_UNRECOGNIZED,  "RETRY",            ST77_ORANGE, ICON_WARN     },
+    { TFT_STATE_COMMAND_TIMEOUT,       "TIMEOUT",          ST77_ORANGE, ICON_WARN     },
+    { TFT_STATE_CMD_KANSEI,            "CMD: KANSEI",      ST77_GREEN,  ICON_APERTURE },
+    { TFT_STATE_CMD_KIROKU,            "CMD: KIROKU",      ST77_GREEN,  ICON_REC      },
+    { TFT_STATE_CMD_IBASHO,            "CMD: IBASHO",      ST77_GREEN,  ICON_PIN      },
+    { TFT_STATE_KANSEI_PROCESSING,     "SWEEPING...",      ST77_CYAN,   ICON_APERTURE },
+    { TFT_STATE_KIROKU_PROCESSING,     "RECORDING...",     ST77_CYAN,   ICON_REC      },
+    { TFT_STATE_KANSEI_DONE,           "KANSEI DONE",      ST77_GREEN,  ICON_CHECK    },
+    { TFT_STATE_KIROKU_SAVED,          "RECORD SAVED",     ST77_GREEN,  ICON_CHECK    },
+    { TFT_STATE_SD_OK,                 "SD: OK",           ST77_GREEN,  ICON_SD       },
+    { TFT_STATE_SD_NOT_FOUND,          "SD: MISSING",      ST77_RED,    ICON_WARN     },
+    { TFT_STATE_SD_BAD_CONFIG,         "SD: BAD CONFIG",   ST77_ORANGE, ICON_WARN     },
+    { TFT_STATE_CONFIRM_KANSEI,        "KANSEI? Y/N",      ST77_ORANGE, ICON_QMARK    },
+    { TFT_STATE_CONFIRM_KIROKU,        "KIROKU? Y/N",      ST77_ORANGE, ICON_QMARK    },
+    { TFT_STATE_CONFIRM_IBASHO,        "IBASHO? Y/N",      ST77_ORANGE, ICON_QMARK    },
+    { TFT_STATE_CMD_CANCELLED,         "CANCELLED",        ST77_RED,    ICON_WARN     },
+    { TFT_STATE_BTN_BUSY,              "SYSTEM BUSY",      ST77_ORANGE, ICON_BUSY     },
 };
 #define STATE_TABLE_LEN (sizeof(kStateTable) / sizeof(kStateTable[0]))
 
@@ -119,10 +147,200 @@ static void start_reminder_timer(void)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Icon primitives. All vector-drawn (no bitmaps) -> zero flash/RAM overhead
+// beyond the tiny bit of drawing code itself. Each icon is ~15px, drawn once
+// per full state redraw, so cost per state change stays negligible.
+// ---------------------------------------------------------------------------
+static void draw_icon(tft_icon_t icon, int16_t cx, int16_t cy, uint16_t color)
+{
+    switch (icon) {
+        case ICON_LOGO:
+            s_gfx->drawCircle(cx, cy, 15, color);
+            s_gfx->drawCircle(cx, cy, 8, color);
+            break;
+
+        case ICON_BT_ON:
+            s_gfx->drawCircle(cx, cy, 13, color);
+            s_gfx->fillCircle(cx, cy, 3, color);
+            break;
+
+        case ICON_BT_OFF:
+            s_gfx->drawCircle(cx, cy, 13, color);
+            s_gfx->drawLine(cx - 9, cy - 9, cx + 9, cy + 9, color);
+            s_gfx->drawLine(cx - 9, cy + 9, cx + 9, cy - 9, color);
+            break;
+
+        case ICON_EAR:
+        case ICON_MIC:
+            s_gfx->fillCircle(cx, cy - 5, 7, color);
+            s_gfx->fillRect(cx - 7, cy - 5, 14, 9, color);
+            s_gfx->drawLine(cx, cy + 6, cx, cy + 13, color);
+            s_gfx->drawLine(cx - 5, cy + 13, cx + 5, cy + 13, color);
+            break;
+
+        case ICON_APERTURE: {
+            s_gfx->drawCircle(cx, cy, 14, color);
+            for (int i = 0; i < 6; i++) {
+                float a = i * (2.0f * (float)M_PI / 6.0f);
+                int16_t x1 = cx + (int16_t)(11.0f * cosf(a));
+                int16_t y1 = cy + (int16_t)(11.0f * sinf(a));
+                int16_t x2 = cx + (int16_t)(4.0f * cosf(a + 0.5f));
+                int16_t y2 = cy + (int16_t)(4.0f * sinf(a + 0.5f));
+                s_gfx->drawLine(x1, y1, x2, y2, color);
+            }
+            break;
+        }
+
+        case ICON_REC:
+            s_gfx->drawCircle(cx, cy, 14, color);
+            s_gfx->fillCircle(cx, cy, 8, color);
+            break;
+
+        case ICON_PIN:
+            s_gfx->fillCircle(cx, cy - 4, 9, color);
+            s_gfx->fillCircle(cx, cy - 4, 4, ST77_BLACK);
+            s_gfx->fillTriangle(cx - 8, cy, cx + 8, cy, cx, cy + 14, color);
+            break;
+
+        case ICON_CHECK:
+            s_gfx->drawLine(cx - 9, cy, cx - 2, cy + 8, color);
+            s_gfx->drawLine(cx - 2, cy + 8, cx + 10, cy - 9, color);
+            s_gfx->drawLine(cx - 9, cy + 1, cx - 2, cy + 9, color);
+            s_gfx->drawLine(cx - 2, cy + 9, cx + 10, cy - 8, color);
+            break;
+
+        case ICON_WARN:
+            s_gfx->drawLine(cx, cy - 14, cx - 13, cy + 11, color);
+            s_gfx->drawLine(cx, cy - 14, cx + 13, cy + 11, color);
+            s_gfx->drawLine(cx - 13, cy + 11, cx + 13, cy + 11, color);
+            s_gfx->drawLine(cx, cy - 5, cx, cy + 3, color);
+            s_gfx->fillCircle(cx, cy + 7, 1, color);
+            break;
+
+        case ICON_SD:
+            s_gfx->drawRect(cx - 10, cy - 13, 20, 26, color);
+            s_gfx->drawLine(cx - 10, cy - 5, cx + 10, cy - 5, color);
+            break;
+
+        case ICON_QMARK:
+            s_gfx->setTextColor(color);
+            s_gfx->setTextSize(3);
+            s_gfx->setCursor(cx - 7, cy - 12);
+            s_gfx->print("?");
+            break;
+
+        case ICON_BUSY:
+            s_gfx->fillTriangle(cx - 10, cy - 13, cx + 10, cy - 13, cx, cy, color);
+            s_gfx->fillTriangle(cx - 10, cy + 13, cx + 10, cy + 13, cx, cy, color);
+            break;
+
+        case ICON_NONE:
+        default:
+            break;
+    }
+}
+
+// Corner "viewfinder" brackets + bottom accent bar. Drawn once per full
+// redraw only (not animated) -> cheap, gives the display a distinct
+// device-HUD identity instead of a flat OLED-style block of text.
+static void draw_hud_frame(uint16_t accent_color)
+{
+    const uint16_t g = ST77_CUSTOM_DARKGREY;
+    const int len = 8;
+
+    s_gfx->drawLine(2, 2, 2 + len, 2, g);
+    s_gfx->drawLine(2, 2, 2, 2 + len, g);
+
+    s_gfx->drawLine(TFT_WIDTH - 3 - len, 2, TFT_WIDTH - 3, 2, g);
+    s_gfx->drawLine(TFT_WIDTH - 3, 2, TFT_WIDTH - 3, 2 + len, g);
+
+    s_gfx->drawLine(2, TFT_HEIGHT - 3, 2 + len, TFT_HEIGHT - 3, g);
+    s_gfx->drawLine(2, TFT_HEIGHT - 3 - len, 2, TFT_HEIGHT - 3, g);
+
+    s_gfx->drawLine(TFT_WIDTH - 3 - len, TFT_HEIGHT - 3, TFT_WIDTH - 3, TFT_HEIGHT - 3, g);
+    s_gfx->drawLine(TFT_WIDTH - 3, TFT_HEIGHT - 3 - len, TFT_WIDTH - 3, TFT_HEIGHT - 3, g);
+
+    s_gfx->fillRect(0, TFT_HEIGHT - 3, TFT_WIDTH, 3, accent_color);
+}
+
+// Countdown ring + big digit. Single deterministic redraw per event
+// (3 -> 2 -> 1 are separate states already driven by CORE_EVT_COUNTDOWN_x),
+// no extra loop needed for the "3,2,1" motion.
+static void draw_countdown_ring(int16_t cx, int16_t cy, int count, uint16_t color)
+{
+    s_gfx->drawCircle(cx, cy, 18, color);
+    s_gfx->drawCircle(cx, cy, 17, color);
+    char buf[2] = { (char)('0' + count), '\0' };
+    s_gfx->setTextColor(color);
+    s_gfx->setTextSize(3);
+    s_gfx->setCursor(cx - 8, cy - 12);
+    s_gfx->print(buf);
+}
+
+// Top status row: SD / WF / BL tags, red/green per connection state.
+// Only drawn on the idle screen (called from render_state when state ==
+// TFT_STATE_IDLE_MIO), so it costs nothing on any other state.
+static void draw_status_row(void)
+{
+    const uint16_t ok_color  = ST77_GREEN;
+    const uint16_t bad_color = ST77_RED;
+    const int16_t y = 13;
+
+    s_gfx->setTextSize(1);
+
+    s_gfx->setTextColor(s_sd_ok ? ok_color : bad_color);
+    s_gfx->setCursor(14, y);
+    s_gfx->print("SD");
+
+    s_gfx->setTextColor(s_wifi_connected ? ok_color : bad_color);
+    s_gfx->setCursor(TFT_WIDTH / 2 - 6, y);
+    s_gfx->print("WF");
+
+    s_gfx->setTextColor(s_bt_connected ? ok_color : bad_color);
+    s_gfx->setCursor(TFT_WIDTH - 14 - 12, y);
+    s_gfx->print("BL");
+}
+
+#define DOTS_Y   112
+#define DOTS_CX  (TFT_WIDTH / 2)
+
+// Partial-redraw progress pulse used only while KANSEI/KIROKU processing.
+// This is called from reminder_timer_callback(), which already fires every
+// REMINDER_INTERVAL_MS on its own -- no new timer, no new task, and the
+// redraw touches a 48x8px strip only, so it stays fast even on slow SPI.
+static void draw_progress_dots(uint8_t frame, uint16_t color)
+{
+    s_gfx->fillRect(DOTS_CX - 24, DOTS_Y - 4, 48, 8, ST77_BLACK);
+    int active = (frame % 3) + 1;
+    for (int i = 0; i < 3; i++) {
+        int16_t dx = DOTS_CX - 16 + i * 16;
+        if (i < active) {
+            s_gfx->fillCircle(dx, DOTS_Y, 3, color);
+        } else {
+            s_gfx->drawCircle(dx, DOTS_Y, 3, color);
+        }
+    }
+}
+
 static void reminder_timer_callback(void *arg)
 {
     if (s_current_state == TFT_STATE_KANSEI_PROCESSING || s_current_state == TFT_STATE_KIROKU_PROCESSING) {
         audio_feedback_play(s_current_processing_sound);
+
+        const tft_state_entry_t *entry = nullptr;
+        for (size_t i = 0; i < STATE_TABLE_LEN; i++) {
+            if (kStateTable[i].state == s_current_state) {
+                entry = &kStateTable[i];
+                break;
+            }
+        }
+        if (entry && s_gfx) {
+            s_anim_frame++;
+            xSemaphoreTake(s_gfx_mutex, portMAX_DELAY);
+            draw_progress_dots(s_anim_frame, entry->color);
+            xSemaphoreGive(s_gfx_mutex);
+        }
     } else {
         stop_reminder_timer();
     }
@@ -144,22 +362,49 @@ static void render_state(tft_state_t state)
     xSemaphoreTake(s_gfx_mutex, portMAX_DELAY);
 
     s_gfx->fillRect(0, 0, TFT_WIDTH, TFT_HEIGHT, ST77_BLACK);
+    draw_hud_frame(entry->color);
 
+    if (state == TFT_STATE_IDLE_MIO) {
+        draw_status_row();
+    }
+
+    const int16_t icon_cx = TFT_WIDTH / 2;
+    const int16_t icon_cy = (state == TFT_STATE_IDLE_MIO) ? 44 : 38;
+
+    bool is_countdown = (state == TFT_STATE_COUNTDOWN_3 ||
+                          state == TFT_STATE_COUNTDOWN_2 ||
+                          state == TFT_STATE_COUNTDOWN_1);
+
+    if (is_countdown) {
+        int digit = (state == TFT_STATE_COUNTDOWN_3) ? 3 :
+                    (state == TFT_STATE_COUNTDOWN_2) ? 2 : 1;
+        draw_countdown_ring(icon_cx, icon_cy, digit, entry->color);
+    } else {
+        draw_icon(entry->icon, icon_cx, icon_cy, entry->color);
+    }
+
+    // Label -- auto-shrinks to size 1 for long strings so nothing clips
+    // off the 160px-wide panel (SD: BAD CONFIG previously overflowed).
     s_gfx->setTextColor(entry->color);
-    s_gfx->setTextSize(2);
-    
     int label_len = strlen(entry->label);
-    int x_pos = (TFT_WIDTH - (label_len * 12)) / 2;
-    if (x_pos < 4) x_pos = 4; 
-
-    s_gfx->setCursor(x_pos, (TFT_HEIGHT / 2) - 8);
+    int text_size = (label_len > 11) ? 1 : 2;
+    s_gfx->setTextSize(text_size);
+    int char_w = text_size * 6;
+    int x_pos = (TFT_WIDTH - (label_len * char_w)) / 2;
+    if (x_pos < 2) x_pos = 2;
+    s_gfx->setCursor(x_pos, 68);
     s_gfx->print(entry->label);
 
     if (state == TFT_STATE_IDLE_MIO) {
         s_gfx->setTextColor(ST77_CUSTOM_DARKGREY);
         s_gfx->setTextSize(1);
-        s_gfx->setCursor(TFT_WIDTH / 2 - 38, (TFT_HEIGHT / 2) + 16);
+        s_gfx->setCursor(TFT_WIDTH / 2 - 38, 92);
         s_gfx->print("SYSTEM ONLINE"); 
+    }
+
+    if (state == TFT_STATE_KANSEI_PROCESSING || state == TFT_STATE_KIROKU_PROCESSING) {
+        s_anim_frame = 0;
+        draw_progress_dots(s_anim_frame, entry->color);
     }
 
     xSemaphoreGive(s_gfx_mutex);
@@ -297,6 +542,8 @@ void tft_display_on_bt_state(bool connected)
 
 void tft_display_on_sd_status(sd_boot_status_t status)
 {
+    s_sd_ok = (status == SD_BOOT_OK);
+
     switch (status) {
         case SD_BOOT_OK:
             request_state(TFT_STATE_SD_OK);
@@ -310,6 +557,18 @@ void tft_display_on_sd_status(sd_boot_status_t status)
             request_state(TFT_STATE_SD_BAD_CONFIG);
             audio_feedback_defer_until_connected(SND_SD_BAD_CONFIG);
             break;
+    }
+}
+
+// NEW: mirrors ESP32-CAM wifi link state onto the idle-screen "WF" tag.
+// Call this from wherever Core learns the CAM's wifi status (e.g. the
+// existing UART/status relay path) -- it only affects the idle screen and
+// does not touch the voice/button command state machine.
+void tft_display_on_wifi_state(bool connected)
+{
+    s_wifi_connected = connected;
+    if (s_current_state == TFT_STATE_IDLE_MIO) {
+        render_state(TFT_STATE_IDLE_MIO); // direct refresh, idle has no timeout timer to disturb
     }
 }
 

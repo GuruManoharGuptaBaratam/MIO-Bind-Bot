@@ -197,6 +197,8 @@ static void uart_init(void)
     ESP_LOGI(TAG, "Command response UART initialized.");
 }
 
+static void i2s_resync_channel(void);
+
 static void i2s_slave_init(void)
 {
     ESP_LOGI(TAG, "Initializing Standard Mode I2S Slave Receiver...");
@@ -227,18 +229,75 @@ static void i2s_slave_init(void)
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_chan, &rx_std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(rx_chan));
     ESP_LOGI(TAG, "I2S Slave Receiver Channel Enabled.");
+
+    // Do NOT block here waiting for a clock. Core (the I2S master) only
+    // drives BCLK/WS once a BT/SCO link is actually up -- there may be no
+    // clock at all for seconds or minutes after boot. Actual resync happens
+    // on-demand in i2s_dma_ingest_task(), triggered by PIN_BT_STATUS.
+}
+
+// As an I2S slave, this board depends entirely on Core actively driving
+// BCLK/WS -- and Core only does that once a BT/SCO link is up (see
+// PIN_BT_STATUS usage below). i2s_channel_enable() only arms the DMA; it
+// does not confirm a clock is present. If the channel was armed before the
+// clock started (cold boot, or any later BT disconnect/reconnect), the DMA
+// can latch into a state that never syncs even after the clock appears.
+// Call this exactly when PIN_BT_STATUS transitions low->high, i.e. exactly
+// when Core is expected to start driving real clock, and it will actively
+// probe for real data, cycling disable/enable until it locks on.
+static void i2s_resync_channel(void)
+{
+    uint8_t probe_buf[640];
+    size_t bytes_read = 0;
+    const int probe_timeout_ms = 300;
+    const int max_attempts = 10; // ~3s cap -- clock should appear almost immediately after SCO connects
+
+    ESP_ERROR_CHECK(i2s_channel_disable(rx_chan));
+    ESP_ERROR_CHECK(i2s_channel_enable(rx_chan));
+
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        esp_err_t err = i2s_channel_read(rx_chan, probe_buf, sizeof(probe_buf),
+                                          &bytes_read, pdMS_TO_TICKS(probe_timeout_ms));
+
+        if (err == ESP_OK && bytes_read > 0) {
+            ESP_LOGI(TAG, "I2S resynced to Core's clock (attempt %d).", attempt);
+            return;
+        }
+
+        ESP_LOGW(TAG, "I2S resync attempt %d/%d: no clock yet (err=%d) — cycling channel...",
+                 attempt, max_attempts, err);
+
+        ESP_ERROR_CHECK(i2s_channel_disable(rx_chan));
+        ESP_ERROR_CHECK(i2s_channel_enable(rx_chan));
+    }
+
+    ESP_LOGE(TAG, "I2S resync gave up after %d attempts — audio path may not sync "
+                   "until the next BT reconnect.", max_attempts);
 }
 
 static void i2s_dma_ingest_task(void *arg)
 {
     uint8_t dma_read_buf[640]; 
     size_t bytes_read = 0;
+    bool bt_was_connected = false; // forces a resync on the first loop iteration where BT reads connected,
+                                    // whether that's right after boot or hours later after a reconnect
 
     while (1) {
-        if (i2s_channel_read(rx_chan, dma_read_buf, sizeof(dma_read_buf), &bytes_read, portMAX_DELAY) == ESP_OK) {
-            if (bytes_read > 0) {
-                xRingbufferSend(s_audio_rb, dma_read_buf, bytes_read, pdMS_TO_TICKS(10));
-            }
+        bool bt_connected = (gpio_get_level(PIN_BT_STATUS) != 0);
+
+        if (bt_connected && !bt_was_connected) {
+            ESP_LOGI(TAG, "BT status rising edge — Core's I2S clock should now be live. Resyncing.");
+            i2s_resync_channel();
+        }
+        bt_was_connected = bt_connected;
+
+        // While BT is down there's no clock to wait on -- use a short timeout so we
+        // keep polling PIN_BT_STATUS instead of blocking forever on a dead channel.
+        esp_err_t err = i2s_channel_read(rx_chan, dma_read_buf, sizeof(dma_read_buf), &bytes_read,
+                                          bt_connected ? portMAX_DELAY : pdMS_TO_TICKS(200));
+
+        if (err == ESP_OK && bytes_read > 0) {
+            xRingbufferSend(s_audio_rb, dma_read_buf, bytes_read, pdMS_TO_TICKS(10));
         }
     }
 }
