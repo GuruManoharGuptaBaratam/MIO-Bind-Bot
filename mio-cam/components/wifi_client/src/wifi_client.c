@@ -186,7 +186,7 @@ esp_err_t wifi_client_connect_with_fallback(const char *primary_ssid, const char
     if (primary_ssid && strlen(primary_ssid) > 0) {
         ESP_LOGI(TAG, "Trying Primary Wi-Fi: '%s'", primary_ssid);
         wifi_client_set_credentials(primary_ssid, primary_pass);
-        
+
         if (wifi_client_connect(timeout_ms) == ESP_OK) {
             return ESP_OK;
         }
@@ -198,7 +198,7 @@ esp_err_t wifi_client_connect_with_fallback(const char *primary_ssid, const char
     if (backup_ssid && strlen(backup_ssid) > 0 && strcmp(primary_ssid, backup_ssid) != 0) {
         ESP_LOGI(TAG, "Switching to Backup Wi-Fi: '%s'", backup_ssid);
         wifi_client_set_credentials(backup_ssid, backup_pass);
-        
+
         if (wifi_client_connect(timeout_ms) == ESP_OK) {
             return ESP_OK;
         }

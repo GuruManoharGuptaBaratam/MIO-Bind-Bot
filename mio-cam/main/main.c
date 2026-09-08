@@ -14,7 +14,7 @@
 
 static const char *TAG = "mio_cam";
 
-#define KANSEI_UPLOAD_URL "https://manoharguptabaratam--mio-kansei-kansei-kansei.modal.run"
+#define KANSEI_UPLOAD_URL "https://YOUR-LIGHTNING-ENDPOINT/kansei"
 #define USER_REF_IMAGE_PATH "/sdcard/user_ref.jpg"
 
 #define MAX_KANSEI_FRAMES 4
@@ -134,21 +134,38 @@ static void handle_kansei(const cam_trigger_packet_t *packet)
     s_kansei_frame_count = 0;
     servo_pan_sweep(on_kansei_angle_fast);
 
-    // 3. Determine credentials dynamically from Core UART packet, with fallback to default macros
-    const char *target_ssid = (packet->has_wifi_creds && strlen(packet->ssid) > 0) ? packet->ssid : WIFI_SSID;
-    const char *target_pass = (packet->has_wifi_creds && strlen(packet->ssid) > 0) ? packet->password : WIFI_PASSWORD;
+    // 3. Reuse the Wi-Fi connection kept alive from boot.
+    // Only reconnect if the connection was actually lost.
+    if (!wifi_client_is_connected()) {
+        const char *target_ssid =
+            (packet->has_wifi_creds && strlen(packet->ssid) > 0)
+                ? packet->ssid
+                : WIFI_SSID;
 
-    const char *fallback_ssid = WIFI_SSID; 
-    const char *fallback_pass = WIFI_PASSWORD;
+        const char *target_pass =
+            (packet->has_wifi_creds && strlen(packet->ssid) > 0)
+                ? packet->password
+                : WIFI_PASSWORD;
 
-    ESP_LOGI(TAG, "kansei: attempting connection with adaptive fallback...");
+        const char *fallback_ssid = WIFI_SSID;
+        const char *fallback_pass = WIFI_PASSWORD;
 
-    // Try Core/Primary credentials first, fallback to default macro credentials if it fails (5s timeout each)
-    if (wifi_client_connect_with_fallback(target_ssid, target_pass, fallback_ssid, fallback_pass, 5000) != ESP_OK) {
-        ESP_LOGE(TAG, "kansei: all Wi-Fi connection attempts failed, aborting upload");
-        clear_kansei_frames();
-        uart_protocol_send_event(CAM_EVENT_JOB_FAILED, NULL, 0);
-        return;
+        ESP_LOGW(TAG, "kansei: Wi-Fi disconnected — reconnecting...");
+
+        if (wifi_client_connect_with_fallback(
+                target_ssid,
+                target_pass,
+                fallback_ssid,
+                fallback_pass,
+                5000) != ESP_OK) {
+
+            ESP_LOGE(TAG, "kansei: Wi-Fi reconnect failed");
+            clear_kansei_frames();
+            uart_protocol_send_event(CAM_EVENT_JOB_FAILED, NULL, 0);
+            return;
+        }
+    } else {
+        ESP_LOGI(TAG, "kansei: Wi-Fi already connected — reusing connection");
     }
 
     // 4. Read user reference image on-demand from SD card
@@ -175,18 +192,18 @@ static void handle_kansei(const cam_trigger_packet_t *packet)
     } else {
         ESP_LOGI(TAG, "kansei: got description (%zu bytes text, %zu bytes audio): %s",
                  strlen(description_text), audio_len, description_text);
-        
+
         // Stream audio back to ESP32-Core over UART
         uart_protocol_send_audio_stream(audio_buf, audio_len);
-        
+
         heap_caps_free(audio_buf);
         uart_protocol_send_event(CAM_EVENT_JOB_DONE, NULL, 0);
     }
 
-    // 6. Guaranteed Cleanup of PSRAM buffers and Wi-Fi connection
+    // 6. Guaranteed Cleanup of PSRAM buffers. Keep Wi-Fi connected.
     free_user_ref_image(&s_current_user_ref);
     clear_kansei_frames();
-    wifi_client_disconnect();
+    ESP_LOGI(TAG, "kansei: cleanup complete — Wi-Fi remains connected");
 }
 
 static void handle_kiroku(const cam_trigger_packet_t *packet)
@@ -319,9 +336,10 @@ void app_main(void)
 
     wifi_client_init(WIFI_SSID, WIFI_PASSWORD);
     if (wifi_client_connect(10000) == ESP_OK) {
-        ESP_LOGI(TAG, "boot-time priming connect OK");
+        ESP_LOGI(TAG, "Wi-Fi connected at boot — keeping connection alive");
+    } else {
+        ESP_LOGW(TAG, "Initial Wi-Fi connection failed — Kansei will retry when needed");
     }
-    wifi_client_disconnect();
 
     /* 4. CREATE TASK WITH EXPANDED 12KB STACK TO PREVENT STACK OVERFLOW DURING HTTP/TLS PROCESSING */
     xTaskCreatePinnedToCore(uart_listener_task, "uart_listener", 12288, NULL, 5, NULL, 1);
