@@ -16,6 +16,7 @@ mio-inference/managed_components/
 mio-cam/managed_components/
 mio-firmware/sdkconfig
 mio-firmware/sdkconfig.old
+/mio-cam/components/wifi_client/include/wifi_credentials.h
 
 mio-inference/sdkconfig
 .DS_Store
