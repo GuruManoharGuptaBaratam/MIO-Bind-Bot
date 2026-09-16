@@ -4,7 +4,7 @@
 
 # MIO
 
-### An edge-AI wearable that turns a glance into a spoken description — fully hands-free.
+### Wearable, wireless, and voice-first — assistive perception built from the ground up.
 
 [![Version](https://img.shields.io/badge/version-V1-blue)]()
 [![Platform](https://img.shields.io/badge/platform-ESP32-orange)]()
