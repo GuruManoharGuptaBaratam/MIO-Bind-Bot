@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+Pillow
+
+torch
+torchvision
+
+transformers
+accelerate
+
+edge-tts
