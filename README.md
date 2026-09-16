@@ -99,6 +99,16 @@ All commands are confirmation-gated: after a gesture is detected, MIO plays a sp
 
 > Note: the SD-card configuration schema (see [SD Card](#sd-card)) already includes SOS contact fields (`SOS1_NAME`/`SOS1_PHONE`, etc.), so the data model for `ibasho` exists on-device — only the send/notify task logic itself is not yet wired up.
 
+### Naming
+
+Each command is named with a Japanese word rather than a generic English verb, chosen because its literal meaning maps directly onto what the command does:
+
+| Command | Japanese | Reading | Meaning |
+|---|---|---|---|
+| `kansei` | [感性] | kansei | sensibility / sensory perception — also the term behind "Kansei Engineering," the design discipline of translating sensory and emotional response into concrete design |
+| `kiroku` | [記録] | kiroku | record / recording |
+| `ibasho` | [居場所] | ibasho | one's place / whereabouts — where someone is, or where they belong |
+
 ---
 
 ## System Architecture
@@ -213,6 +223,7 @@ The Core board pins latency-sensitive audio tasks to Core 1 (I2S feeder and audi
 - ST7735 TFT display
 - IMU
 - microSD card slot
+- 1× physical push button (gesture input — click-count and long-press detection)
 - CMF Buds (Bluetooth earbuds — audio input/output)
 - External buck converter for the camera board's 3.3V rail
 
